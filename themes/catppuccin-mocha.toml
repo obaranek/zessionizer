@@ -1,0 +1,15 @@
+name = "catppuccin-mocha"
+
+[colors]
+header_fg = "#f9e2af"
+selection_fg = "#1e1e2e"
+selection_bg = "#89b4fa"
+text_normal = "#89b4fa"
+text_dim = "#6c7086"
+border = "#45475a"
+search_bar_border = "#cba6f7"
+match_highlight_fg = "#1e1e2e"
+match_highlight_bg = "#f9e2af"
+empty_state_fg = "#f38ba8"
+active_session_fg = "#f9e2af"
+

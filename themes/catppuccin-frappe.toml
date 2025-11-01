@@ -1,0 +1,15 @@
+name = "catppuccin-frappe"
+
+[colors]
+header_fg = "#c6d0f5"
+selection_fg = "#303446"
+selection_bg = "#8caaee"
+text_normal = "#8caaee"
+text_dim = "#737994"
+border = "#51576d"
+search_bar_border = "#ca9ee6"
+match_highlight_fg = "#303446"
+match_highlight_bg = "#e5c890"
+empty_state_fg = "#ea999c"
+active_session_fg = "#e5c890"
+
