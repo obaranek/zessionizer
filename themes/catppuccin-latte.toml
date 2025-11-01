@@ -1,0 +1,15 @@
+name = "catppuccin-latte"
+
+[colors]
+header_fg = "#4c4f69"
+selection_fg = "#eff1f5"
+selection_bg = "#1e66f5"
+text_normal = "#1e66f5"
+text_dim = "#9ca0b0"
+border = "#acb0be"
+search_bar_border = "#8839ef"
+match_highlight_fg = "#eff1f5"
+match_highlight_bg = "#df8e1d"
+empty_state_fg = "#d20f39"
+active_session_fg = "#df8e1d"
+

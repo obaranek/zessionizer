@@ -1,0 +1,15 @@
+name = "catppuccin-macchiato"
+
+[colors]
+header_fg = "#cad3f5"
+selection_fg = "#24273a"
+selection_bg = "#8aadf4"
+text_normal = "#8aadf4"
+text_dim = "#6e738d"
+border = "#494d64"
+search_bar_border = "#c6a0f6"
+match_highlight_fg = "#24273a"
+match_highlight_bg = "#eed49f"
+empty_state_fg = "#ed8796"
+active_session_fg = "#eed49f"
+
