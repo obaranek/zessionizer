@@ -94,6 +94,7 @@ macro_rules! worker_message_builders {
 worker_message_builders! {
     load_projects(LoadProjects { with_sessions: bool }),
     update_frecency(UpdateFrecency { path: String }),
+    update_project_layout(UpdateProjectLayout { path: String, layout: Option<String> }),
     add_projects_batch(AddProjectsBatch { projects: Vec<(String, String)> }),
     sync_sessions(SyncSessions { active_sessions: Vec<String> }),
 }
@@ -144,6 +145,19 @@ pub enum WorkerMessage {
         #[serde(skip_serializing_if = "Option::is_none")]
         trace_context: Option<TraceContext>,
     },
+
+    /// Update the layout associated with a project.
+    UpdateProjectLayout {
+        /// Filesystem path of the project to update.
+        path: String,
+
+        /// New layout to associate with the project (None to clear).
+        layout: Option<String>,
+
+        /// Trace context for linking spans across threads.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        trace_context: Option<TraceContext>,
+    },
 }
 
 /// Responses sent from the worker thread back to the main thread.
@@ -183,5 +197,11 @@ pub enum WorkerResponse {
     Error {
         /// Human-readable error message.
         message: String,
+    },
+
+    /// Project layout was successfully updated.
+    LayoutUpdated {
+        /// Path of the project whose layout was updated.
+        path: String,
     },
 }

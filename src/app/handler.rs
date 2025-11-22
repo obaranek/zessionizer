@@ -120,6 +120,14 @@ pub enum Event {
     /// Processed by matching on the inner [`WorkerResponse`] variant. May
     /// cause project list updates, state changes, or error handling.
     WorkerResponse(WorkerResponse),
+
+    /// Updates the layout associated with a project.
+    UpdateProjectLayout {
+        /// Path of the project to update.
+        path: String,
+        /// New layout to associate with the project.
+        layout: Option<String>,
+    },
 }
 
 /// Processes an event, mutates application state, and returns actions to execute.
@@ -200,12 +208,14 @@ pub fn handle_event(state: &mut AppState, event: &Event) -> Result<(bool, Vec<Ac
                 actions.push(Action::SwitchSession {
                     name: project.name.clone(),
                     path: PathBuf::from(&project.path),
+                    layout: project.layout.clone(),
                 });
             } else {
                 tracing::debug!(session_name = %project.name, "creating new session");
                 actions.push(Action::CreateSession {
                     name: project.name.clone(),
                     path: PathBuf::from(&project.path),
+                    layout: project.layout.clone(),
                 });
             }
 
@@ -351,25 +361,55 @@ pub fn handle_event(state: &mut AppState, event: &Event) -> Result<(bool, Vec<Ac
             // (/.git or /.zessionizer) from the paths returned by find
             let projects: Vec<(String, String)> = git_directories
                 .iter()
-                .map(|marker_path| {
-                    let without_host = marker_path.strip_prefix("/host").unwrap_or(marker_path);
+                .filter_map(|marker_path| {
+                    // Determine if path starts with /host prefix to decide normalization strategy
+                    let (without_host, is_sandbox_path) = if marker_path.starts_with("/host") {
+                        (marker_path.strip_prefix("/host").unwrap_or(marker_path), true)
+                    } else {
+                        (marker_path.as_str(), false)
+                    };
+
+                    // Strip the marker suffixes (/.git or /.zessionizer)
                     let project_path = without_host
                         .strip_suffix("/.git")
                         .or_else(|| without_host.strip_suffix("/.zessionizer"))
                         .unwrap_or(without_host);
 
-                    let project_name = project_path
+                    // Normalize the path by removing leading slashes if it's a relative path
+                    // that was meant to be relative to home directory
+                    let normalized_path = if project_path.starts_with("~/") {
+                        project_path.to_string()
+                    } else if project_path.starts_with('/') {
+                        // Absolute path - keep as is
+                        project_path.to_string()
+                    } else if is_sandbox_path {
+                        // Path was in sandbox format but became relative after stripping /host
+                        format!("/{}", project_path)
+                    } else {
+                        project_path.to_string()
+                    };
+
+                    let project_name_raw = normalized_path
                         .split('/')
                         .next_back()
                         .unwrap_or("unknown");
 
+                    let project_name = project_name_raw.to_string();
+
                     tracing::debug!(
                         project_name = %project_name,
-                        project_path = %project_path,
+                        project_path = %normalized_path,
+                        original_path = %marker_path,
+                        is_sandbox_path = is_sandbox_path,
                         "discovered project"
                     );
 
-                    (project_path.to_string(), project_name.to_string())
+                    if project_name_raw != "unknown" {
+                        Some((normalized_path, project_name))
+                    } else {
+                        tracing::debug!(path = %marker_path, "skipping invalid project path");
+                        None
+                    }
                 })
                 .collect();
 
@@ -378,8 +418,25 @@ pub fn handle_event(state: &mut AppState, event: &Event) -> Result<(bool, Vec<Ac
             if projects.is_empty() {
                 tracing::debug!("no new projects found during scan");
             } else {
+                // Remove potential duplicates by using a unique key (project name maps to most recent path)
+                use std::collections::HashMap;
+                let mut unique_projects = HashMap::new();
+                
+                for (path, name) in projects {
+                    // Only keep the first occurrence of each project name to avoid duplicates
+                    unique_projects.entry(name.clone()).or_insert_with(|| (path, name));
+                }
+                
+                let deduplicated_projects: Vec<(String, String)> = unique_projects.into_values().collect();
+                
+                tracing::debug!(
+                    unique_projects_count = deduplicated_projects.len(),
+                    original_count = git_directories.len(),
+                    "deduplicated projects"
+                );
+
                 actions.push(Action::PostToWorker(
-                    WorkerMessage::add_projects_batch(projects)
+                    WorkerMessage::add_projects_batch(deduplicated_projects)
                 ));
             }
 
@@ -432,11 +489,23 @@ pub fn handle_event(state: &mut AppState, event: &Event) -> Result<(bool, Vec<Ac
                         }
                     }
                 }
+                WorkerResponse::LayoutUpdated { path: _ } => {
+                    tracing::debug!("project layout updated successfully");
+                    // Refresh projects to reflect the layout change
+                    Ok((false, vec![Action::PostToWorker(WorkerMessage::load_projects(false))]))
+                }
                 WorkerResponse::Error { message } => {
                     tracing::error!("Worker error: {}", message);
                     Ok((true, vec![]))
                 }
             }
+        }
+        Event::UpdateProjectLayout { path, layout } => {
+            tracing::debug!(project_path = %path, layout = ?layout, "handling update project layout event");
+            Ok((false, vec![Action::UpdateProjectLayout {
+                path: path.clone(),
+                layout: layout.clone(),
+            }]))
         }
     }
 }

@@ -63,6 +63,7 @@ impl ZessionizerWorker {
             name: record.name,
             last_accessed: record.last_accessed.unwrap_or(record.created_at),
             created_at: record.created_at,
+            layout: record.layout,
         }
     }
 
@@ -142,6 +143,7 @@ impl ZessionizerWorker {
                 last_accessed: Some(now),
                 created_at: now,
                 access_count: 1,
+                layout: None,
             })
             .collect();
 
@@ -179,6 +181,20 @@ impl ZessionizerWorker {
         )
     }
 
+    /// Handles the `UpdateProjectLayout` message.
+    ///
+    /// Updates the layout associated with a specific project.
+    fn handle_update_project_layout(&mut self, path: String, layout: Option<String>) -> WorkerResponse {
+        Self::handle_db_result(
+            "update project layout",
+            self.get_storage().and_then(|storage| storage.update_project_layout(&path, layout)),
+            |_| {
+                tracing::debug!(project_path = %path, "project layout updated");
+                WorkerResponse::LayoutUpdated { path }
+            },
+        )
+    }
+
     /// Attaches the parent trace context from a message to the current thread.
     ///
     /// This function reconstructs the OpenTelemetry context from the serialized
@@ -192,6 +208,7 @@ impl ZessionizerWorker {
         let trace_context = match message {
             WorkerMessage::LoadProjects { trace_context, .. }
             | WorkerMessage::UpdateFrecency { trace_context, .. }
+            | WorkerMessage::UpdateProjectLayout { trace_context, .. }
             | WorkerMessage::AddProjectsBatch { trace_context, .. }
             | WorkerMessage::SyncSessions { trace_context, .. } => trace_context,
         }
@@ -230,6 +247,8 @@ impl ZessionizerWorker {
             }
 
             WorkerMessage::UpdateFrecency { path, .. } => self.handle_update_frecency(path),
+
+            WorkerMessage::UpdateProjectLayout { path, layout, .. } => self.handle_update_project_layout(path, layout),
 
             WorkerMessage::AddProjectsBatch { projects, .. } => {
                 self.handle_add_projects_batch(projects)

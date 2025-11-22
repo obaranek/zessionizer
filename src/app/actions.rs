@@ -53,6 +53,8 @@ pub enum Action {
         name: String,
         /// Filesystem path to set as working directory.
         path: PathBuf,
+        /// Optional layout to use when switching session.
+        layout: Option<String>,
     },
 
     /// Creates a new Zellij session.
@@ -64,6 +66,8 @@ pub enum Action {
         name: String,
         /// Filesystem path to set as working directory.
         path: PathBuf,
+        /// Optional layout to use when creating session.
+        layout: Option<String>,
     },
 
     /// Kills an existing Zellij session.
@@ -73,5 +77,13 @@ pub enum Action {
     KillSession {
         /// Name of the session to terminate.
         name: String,
+    },
+
+    /// Updates the layout associated with a project.
+    UpdateProjectLayout {
+        /// Path of the project to update.
+        path: String,
+        /// New layout to associate with the project (None to clear).
+        layout: Option<String>,
     },
 }
