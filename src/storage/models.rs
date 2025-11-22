@@ -27,12 +27,15 @@ pub struct ProjectRecord {
 
     /// Unix timestamp when the project was first added to storage.
     pub created_at: i64,
+
+    /// Optional layout to use when creating a session for this project
+    pub layout: Option<String>,
 }
 
 impl ProjectRecord {
     /// Creates a new project record with default values.
     ///
-    /// Sets `access_count` to 1, `last_accessed` to `None`, and `created_at` to the current time.
+    /// Sets `access_count` to 1, `last_accessed` to `None`, `layout` to `None`, and `created_at` to the current time.
     ///
     /// # Examples
     ///
@@ -45,6 +48,7 @@ impl ProjectRecord {
     /// );
     /// assert_eq!(record.access_count, 1);
     /// assert!(record.last_accessed.is_none());
+    /// assert!(record.layout.is_none());
     /// ```
     pub fn new(path: impl Into<String>, name: impl Into<String>) -> Self {
         Self {
@@ -53,6 +57,7 @@ impl ProjectRecord {
             last_accessed: None,
             access_count: 1,
             created_at: chrono::Utc::now().timestamp(),
+            layout: None,
         }
     }
 }

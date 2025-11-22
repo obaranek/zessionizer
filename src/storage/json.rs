@@ -345,6 +345,24 @@ impl Storage for JsonStorage {
         );
         Ok(())
     }
+
+    fn update_project_layout(&mut self, path: &str, layout: Option<String>) -> Result<()> {
+        let _span = tracing::debug_span!("json_update_project_layout",
+            path = %path,
+            layout = ?layout
+        ).entered();
+
+        let project = self.data.projects.get_mut(path)
+            .ok_or_else(|| ZessionizerError::Storage(format!("project not found: {path}")))?;
+
+        project.layout = layout;
+
+        self.dirty = true;
+        self.save_to_file()?;
+
+        tracing::debug!("project layout updated");
+        Ok(())
+    }
 }
 
 impl Drop for JsonStorage {

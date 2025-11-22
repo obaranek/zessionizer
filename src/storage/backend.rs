@@ -101,4 +101,11 @@ pub trait Storage: Send {
     ///
     /// Returns an error if the sync operation fails.
     fn sync_sessions(&mut self, active_session_names: &[String]) -> Result<()>;
+
+    /// Updates the layout associated with a project.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the project doesn't exist or the update fails.
+    fn update_project_layout(&mut self, path: &str, layout: Option<String>) -> Result<()>;
 }

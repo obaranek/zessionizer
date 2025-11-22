@@ -28,6 +28,7 @@ const SECONDS_PER_DAY: i64 = 86400;
 /// - `name`: Display name derived from the directory name
 /// - `last_accessed`: Unix timestamp of most recent access
 /// - `created_at`: Unix timestamp when the project was first added
+/// - `layout`: Optional layout to use when creating a session for this project
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Project {
     pub id: Option<i64>,
@@ -35,6 +36,7 @@ pub struct Project {
     pub name: String,
     pub last_accessed: i64,
     pub created_at: i64,
+    pub layout: Option<String>,
 }
 
 impl Project {
@@ -42,6 +44,7 @@ impl Project {
     ///
     /// Both `last_accessed` and `created_at` timestamps are set to the current time.
     /// The `id` field is set to `None` until the project is persisted to storage.
+    /// The `layout` field is set to `None` initially.
     ///
     /// # Examples
     ///
@@ -55,6 +58,7 @@ impl Project {
     /// assert_eq!(project.path, "/home/user/code/myproject");
     /// assert_eq!(project.name, "myproject");
     /// assert!(project.id.is_none());
+    /// assert!(project.layout.is_none());
     /// ```
     #[must_use]
     pub fn new(path: String, name: String) -> Self {
@@ -65,6 +69,7 @@ impl Project {
             name,
             last_accessed: now,
             created_at: now,
+            layout: None,
         }
     }
 

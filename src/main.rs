@@ -76,7 +76,7 @@
 
 use std::collections::BTreeMap;
 use zellij_tile::prelude::*;
-use zellij_tile::shim::post_message_to;
+use zellij_tile::shim::{post_message_to, switch_session_with_layout};
 
 use zessionizer::worker::{WorkerMessage, WorkerResponse, ZessionizerWorker};
 use zessionizer::{handle_event, Action, Config, Event, InputMode};
@@ -101,6 +101,12 @@ struct State {
 
     /// Configured scan depth (for `find` command).
     scan_depth: u32,
+
+    /// Configured default layout (for session creation).
+    default_layout: Option<String>,
+
+    /// Configured ignore_layouts option to disable layout lookup
+    ignore_layouts: bool,
 }
 
 impl Default for State {
@@ -111,171 +117,41 @@ impl Default for State {
             worker_name: "zessionizer".to_string(),
             scan_paths: Vec::new(),
             scan_depth: 4,
+            default_layout: None,
+            ignore_layouts: default_config.ignore_layouts,
         }
-    }
-}
-
-impl ZellijPlugin for State {
-    /// Initializes the plugin on load.
-    ///
-    /// Called once during plugin startup. Parses configuration, initializes
-    /// application state, requests permissions, subscribes to events, and
-    /// posts initial worker message.
-    ///
-    /// # Tracing
-    ///
-    /// The entire load process is instrumented with OpenTelemetry spans.
-    ///
-    /// # Permissions
-    ///
-    /// Requests:
-    /// - `ReadApplicationState`: Read session info
-    /// - `ChangeApplicationState`: Switch/create/kill sessions
-    /// - `RunCommands`: Execute `find` for project scanning
-    /// - `FullHdAccess`: Read filesystem for Git directories
-    ///
-    /// # Subscriptions
-    ///
-    /// - `Key`: Keyboard input
-    /// - `SessionUpdate`: Session lifecycle changes
-    /// - `CustomMessage`: Worker responses
-    /// - `RunCommandResult`: `find` command output
-    fn load(&mut self, configuration: BTreeMap<String, String>) {
-        let config = Config::from_zellij(&configuration);
-        zessionizer::observability::init_tracing(&config);
-
-        let span = tracing::debug_span!("plugin_load");
-        let _guard = span.entered();
-
-        tracing::debug!("plugin loading started");
-        tracing::debug!(scan_paths = ?config.scan_paths, "parsed configuration");
-        self.app = zessionizer::initialize(&config);
-        tracing::debug!("app state initialized");
-
-        tracing::debug!("requesting permissions");
-        request_permission(&[
-            PermissionType::ReadApplicationState,
-            PermissionType::ChangeApplicationState,
-            PermissionType::RunCommands,
-            PermissionType::FullHdAccess,
-        ]);
-
-        tracing::debug!("subscribing to events");
-        subscribe(&[
-            EventType::Key,
-            EventType::SessionUpdate,
-            EventType::CustomMessage,
-            EventType::RunCommandResult,
-            EventType::PermissionRequestResult,
-            EventType::FileSystemCreate,
-            EventType::FileSystemUpdate,
-            EventType::FileSystemDelete,
-        ]);
-
-        self.scan_paths.clone_from(&config.scan_paths);
-        self.scan_depth = config.scan_depth;
-
-        tracing::debug!("plugin load complete - waiting for permissions");
-    }
-
-    /// Handles incoming Zellij events.
-    ///
-    /// Translates Zellij events to library events, delegates to `handle_event`,
-    /// and executes resulting actions. Returns `true` if the UI should re-render.
-    ///
-    /// # Filesystem Scanning
-    ///
-    /// Periodic `Timer` events trigger filesystem scans via `find` command to discover
-    /// Git repositories in configured scan paths. Results are sent to the worker
-    /// for batch insertion.
-    ///
-    /// # Tracing
-    ///
-    /// Each event is traced with its type for observability.
-    ///
-    /// # Parameters
-    ///
-    /// * `event` - Zellij event to process
-    ///
-    /// # Returns
-    ///
-    /// - `true` if the plugin UI should re-render
-    /// - `false` if the event was ignored or resulted in no state changes
-    fn update(&mut self, event: zellij_tile::prelude::Event) -> bool {
-        let event_name = Self::get_event_name(&event);
-        let span_name = format!("plugin_update::{event_name}");
-        let span = tracing::debug_span!("plugin_update_event", otel.name = %span_name, event_type = %event_name);
-        let _guard = span.entered();
-
-        tracing::debug!(event = %event_name, "processing event");
-
-        let our_event = match event {
-            zellij_tile::prelude::Event::Key(ref key) => match self.map_key_event(key) {
-                Some(event) => event,
-                None => return false,
-            },
-            zellij_tile::prelude::Event::CustomMessage(message, payload) => {
-                match self.map_custom_message_event(&message, &payload) {
-                    Some(event) => event,
-                    None => return false,
-                }
-            }
-            zellij_tile::prelude::Event::RunCommandResult(exit_code, stdout, stderr, _context) => {
-                Self::map_command_result_event(exit_code, stdout, stderr)
-            }
-            zellij_tile::prelude::Event::SessionUpdate(session_infos, _resurrectable_sessions) => {
-                Self::map_session_update_event(&session_infos)
-            }
-            zellij_tile::prelude::Event::FileSystemCreate(paths)
-            | zellij_tile::prelude::Event::FileSystemUpdate(paths)
-            | zellij_tile::prelude::Event::FileSystemDelete(paths) => {
-                tracing::debug!(
-                    path_count = paths.len(),
-                    "filesystem change detected - triggering scan"
-                );
-                self.trigger_filesystem_scan();
-                return false;
-            }
-            zellij_tile::prelude::Event::PermissionRequestResult(permissions) => {
-                self.handle_permission_result(permissions);
-                return false;
-            }
-            _ => return false,
-        };
-
-        match handle_event(&mut self.app, &our_event) {
-            Ok((should_render, actions)) => {
-                tracing::debug!(
-                    action_count = actions.len(),
-                    should_render = should_render,
-                    "event handled successfully"
-                );
-                for a in actions {
-                    self.execute_action(&a);
-                }
-                should_render
-            }
-            Err(e) => {
-                tracing::debug!(error = %e, "error handling event");
-                false
-            }
-        }
-    }
-
-    /// Renders the plugin UI.
-    ///
-    /// Delegates to the library's rendering layer.
-    ///
-    /// # Parameters
-    ///
-    /// * `rows` - Terminal height in rows
-    /// * `cols` - Terminal width in columns
-    fn render(&mut self, rows: usize, cols: usize) {
-        zessionizer::ui::render(&self.app, rows, cols);
     }
 }
 
 impl State {
+
+    /// Posts a message to the worker thread.
+    ///
+    /// Serializes the message as JSON and sends via Zellij's IPC system.
+    ///
+    /// # Parameters
+    ///
+    /// * `message` - Worker message to send
+    ///
+    /// # Errors
+    ///
+    /// Logs serialization errors but does not propagate them.
+    fn post_worker_message(&self, message: &WorkerMessage) {
+        match serde_json::to_string(&message) {
+            Ok(payload) => {
+                tracing::debug!(payload_len = payload.len(), "posting message to worker");
+                post_message_to(PluginMessage {
+                    worker_name: Some(self.worker_name.clone()),
+                    name: self.worker_name.clone(),
+                    payload,
+                });
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "failed to serialize worker message");
+            }
+        }
+    }
+
     /// Triggers filesystem scan for .git directories and .zessionizer marker files.
     fn trigger_filesystem_scan(&self) {
         tracing::debug!(
@@ -283,12 +159,15 @@ impl State {
         );
 
         for scan_path in &self.scan_paths {
+            // Properly expand tilde paths for the Zellij sandbox environment
             let expanded_path = if scan_path.starts_with("~/") {
-                scan_path.strip_prefix("~/").unwrap_or(scan_path)
+                // Replace ~/ with /host/ to access user's home directory in the sandbox
+                format!("/host/{}", scan_path.strip_prefix("~/").unwrap_or(scan_path))
             } else if scan_path == "~" {
-                "."
+                "/host".to_string()
             } else {
-                scan_path.as_str()
+                // For absolute paths, ensure they're accessible in the sandbox if needed
+                scan_path.clone()
             };
 
             tracing::debug!(scan_path = %scan_path, expanded_path = %expanded_path, "scanning path");
@@ -296,7 +175,7 @@ impl State {
             run_command(
                 &[
                     "find",
-                    expanded_path,
+                    &expanded_path,
                     "-maxdepth",
                     &self.scan_depth.to_string(),
                     "(",
@@ -315,6 +194,7 @@ impl State {
             );
         }
     }
+
 
     /// Gets a string name for a Zellij event for logging purposes.
     fn get_event_name(event: &zellij_tile::prelude::Event) -> String {
@@ -445,33 +325,6 @@ impl State {
         }
     }
 
-    /// Posts a message to the worker thread.
-    ///
-    /// Serializes the message as JSON and sends via Zellij's IPC system.
-    ///
-    /// # Parameters
-    ///
-    /// * `message` - Worker message to send
-    ///
-    /// # Errors
-    ///
-    /// Logs serialization errors but does not propagate them.
-    fn post_worker_message(&self, message: &WorkerMessage) {
-        match serde_json::to_string(&message) {
-            Ok(payload) => {
-                tracing::debug!(payload_len = payload.len(), "posting message to worker");
-                post_message_to(PluginMessage {
-                    worker_name: Some(self.worker_name.clone()),
-                    name: self.worker_name.clone(),
-                    payload,
-                });
-            }
-            Err(e) => {
-                tracing::debug!(error = %e, "failed to serialize worker message");
-            }
-        }
-    }
-
     /// Executes an action returned from event handling.
     ///
     /// Translates library actions to Zellij API calls.
@@ -494,34 +347,204 @@ impl State {
                 tracing::debug!("closing plugin focus");
                 hide_self();
             }
-            Action::SwitchSession { ref name, ref path } => {
-                tracing::debug!(session = %name, path = ?path, "switching to session");
+             Action::SwitchSession { ref name, ref path, ref layout } => {
+                 tracing::debug!(session = %name, path = ?path, layout = ?layout, "switching to session");
 
-                let path_str = path.to_string_lossy().to_string();
-                self.post_worker_message(&WorkerMessage::update_frecency(path_str));
-                self.post_worker_message(&WorkerMessage::load_projects(false));
+                 let path_str = path.to_string_lossy().to_string();
+                 self.post_worker_message(&WorkerMessage::update_frecency(path_str));
+                 self.post_worker_message(&WorkerMessage::load_projects(false));
 
-                switch_session_with_cwd(Some(name), Some(path.clone()));
-                hide_self();
+                 // Determine which layout to use with proper priority:
+                 // 1. Project-named layout (e.g., {name}.kdl) if ignore_layouts is false
+                 // 2. Default layout from config (if provided and ignore_layouts is false)
+                 // 3. No layout (use Zellij's default)
+                 let layout_to_use = if !self.ignore_layouts {
+                     // First, try project-named layout
+                     let project_layout = format!("{}.kdl", name);
+                     tracing::debug!(project_name = %name, project_layout = %project_layout, "attempting to use project-named layout");
+                     Some(project_layout)
+                 } else {
+                     // If ignore_layouts is true, skip to default layout or none
+                     self.default_layout.as_ref().map(|default_layout| {
+                         let default_layout_file = format!("{}.kdl", default_layout);
+                         tracing::debug!(project_name = %name, default_layout = %default_layout_file, "using default layout due to ignore_layouts setting");
+                         default_layout_file
+                     })
+                 };
+
+                 // Use the original path directly - Zellij handles path conversion internally
+                 let zellij_path = path.clone();
+
+                 match layout_to_use {
+                     Some(layout_file) => {
+                         tracing::debug!(project_name = %name, layout_file = %layout_file, "attempting to switch with layout");
+                         switch_session_with_layout(Some(name), LayoutInfo::File(layout_file), Some(zellij_path));
+                     },
+                     None => {
+                         tracing::debug!(project_name = %name, "switching with cwd only (no layout)");
+                         switch_session_with_cwd(Some(name), Some(zellij_path));
+                     }
+                 }
+             }
+             Action::CreateSession { ref name, ref path, ref layout } => {
+                 tracing::debug!(session = %name, path = ?path, layout = ?layout, "creating new session");
+
+                 // Determine which layout to use with proper priority:
+                 // 1. Project-named layout (e.g., {name}.kdl) if ignore_layouts is false
+                 // 2. Default layout from config (if provided and ignore_layouts is false)
+                 // 3. No layout (use Zellij's default)
+                 let layout_to_use = if !self.ignore_layouts {
+                     // First, try project-named layout
+                     let project_layout = format!("{}.kdl", name);
+                     tracing::debug!(project_name = %name, project_layout = %project_layout, "attempting to use project-named layout");
+                     Some(project_layout)
+                 } else {
+                     // If ignore_layouts is true, skip to default layout or none
+                     self.default_layout.as_ref().map(|default_layout| {
+                         let default_layout_file = format!("{}.kdl", default_layout);
+                         tracing::debug!(project_name = %name, default_layout = %default_layout_file, "using default layout due to ignore_layouts setting");
+                         default_layout_file
+                     })
+                 };
+
+                 // Use the original path directly - Zellij handles path conversion internally
+                 let zellij_path = path.clone();
+
+                 match layout_to_use {
+                     Some(layout_file) => {
+                         tracing::debug!(project_name = %name, layout_file = %layout_file, "attempting to create with layout");
+                         switch_session_with_layout(Some(name), LayoutInfo::File(layout_file), Some(zellij_path));
+                     },
+                     None => {
+                         tracing::debug!(project_name = %name, "creating with cwd only (no layout)");
+                         switch_session_with_cwd(Some(name), Some(zellij_path));
+                     }
+                 }
+                 hide_self();
+              }
+             Action::KillSession { ref name } => {
+                 tracing::debug!(session = %name, "killing session");
+                 kill_sessions(&[name]);
+             }
+             Action::PostToWorker(ref message) => {
+                 tracing::debug!(message = ?message, "posting message to worker");
+                 self.post_worker_message(message);
+             }
+             Action::UpdateProjectLayout { ref path, ref layout } => {
+                 tracing::debug!(project_path = %path, layout = ?layout, "updating project layout");
+                 self.post_worker_message(&WorkerMessage::update_project_layout(path.clone(), layout.clone()));
+             }
+         }
+     }
+}
+impl ZellijPlugin for State {
+    fn load(&mut self, configuration: BTreeMap<String, String>) {
+        let config = Config::from_zellij(&configuration);
+        zessionizer::observability::init_tracing(&config);
+
+        let span = tracing::debug_span!("plugin_load");
+        let _guard = span.entered();
+
+        tracing::debug!("plugin loading started");
+        tracing::debug!(scan_paths = ?config.scan_paths, "parsed configuration");
+        self.app = zessionizer::initialize(&config);
+        tracing::debug!("app state initialized");
+
+        tracing::debug!("requesting permissions");
+        request_permission(&[
+            PermissionType::ReadApplicationState,
+            PermissionType::ChangeApplicationState,
+            PermissionType::RunCommands,
+            PermissionType::FullHdAccess,
+        ]);
+
+        tracing::debug!("subscribing to events");
+        subscribe(&[
+            EventType::Key,
+            EventType::SessionUpdate,
+            EventType::CustomMessage,
+            EventType::RunCommandResult,
+            EventType::PermissionRequestResult,
+            EventType::FileSystemCreate,
+            EventType::FileSystemUpdate,
+            EventType::FileSystemDelete,
+        ]);
+
+        self.scan_paths.clone_from(&config.scan_paths);
+        self.scan_depth = config.scan_depth;
+        self.default_layout.clone_from(&config.layout);
+        self.ignore_layouts = config.ignore_layouts;
+
+        tracing::debug!("plugin load complete - waiting for permissions");
+    }
+
+    fn update(&mut self, event: zellij_tile::prelude::Event) -> bool {
+        let event_name = Self::get_event_name(&event);
+        let span_name = format!("plugin_update::{event_name}");
+        let span = tracing::debug_span!("plugin_update_event", otel.name = %span_name, event_type = %event_name);
+        let _guard = span.entered();
+
+        tracing::debug!(event = %event_name, "processing event");
+
+        let our_event = match event {
+            zellij_tile::prelude::Event::Key(ref key) => match self.map_key_event(key) {
+                Some(event) => event,
+                None => return false,
+            },
+            zellij_tile::prelude::Event::CustomMessage(message, payload) => {
+                match self.map_custom_message_event(&message, &payload) {
+                    Some(event) => event,
+                    None => return false,
+                }
             }
-            Action::CreateSession { ref name, ref path } => {
-                tracing::debug!(session = %name, path = ?path, "creating new session");
-
-                let path_str = path.to_string_lossy().to_string();
-                self.post_worker_message(&WorkerMessage::update_frecency(path_str));
-                self.post_worker_message(&WorkerMessage::load_projects(false));
-
-                switch_session_with_cwd(Some(name), Some(path.clone()));
-                hide_self();
+            zellij_tile::prelude::Event::RunCommandResult(exit_code, stdout, stderr, _context) => {
+                Self::map_command_result_event(exit_code, stdout, stderr)
             }
-            Action::KillSession { ref name } => {
-                tracing::debug!(session = %name, "killing session");
-                kill_sessions(&[name]);
+            zellij_tile::prelude::Event::SessionUpdate(session_infos, _resurrectable_sessions) => {
+                Self::map_session_update_event(&session_infos)
             }
-            Action::PostToWorker(ref message) => {
-                tracing::debug!(message = ?message, "posting message to worker");
-                self.post_worker_message(message);
+            zellij_tile::prelude::Event::FileSystemCreate(paths)
+            | zellij_tile::prelude::Event::FileSystemUpdate(paths)
+            | zellij_tile::prelude::Event::FileSystemDelete(paths) => {
+                tracing::debug!(
+                    path_count = paths.len(),
+                    "filesystem change detected - triggering scan"
+                );
+                self.trigger_filesystem_scan();
+                return false;
+            }
+            zellij_tile::prelude::Event::PermissionRequestResult(permissions) => {
+                self.handle_permission_result(permissions);
+                return false;
+            }
+            _ => return false,
+        };
+
+        match handle_event(&mut self.app, &our_event) {
+            Ok((should_render, actions)) => {
+                tracing::debug!(
+                    action_count = actions.len(),
+                    should_render = should_render,
+                    "event handled successfully"
+                );
+                for a in actions {
+                    self.execute_action(&a);
+                }
+                should_render
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "error handling event");
+                false
             }
         }
+    }
+
+    fn pipe(&mut self, _pipe_message: PipeMessage) -> bool {
+        // Not used in this plugin
+        false
+    }
+
+    fn render(&mut self, rows: usize, cols: usize) {
+        zessionizer::ui::render(&self.app, rows, cols);
     }
 }

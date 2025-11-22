@@ -206,6 +206,7 @@ use std::collections::BTreeMap;
 ///     theme "catppuccin-mocha"
 ///     theme_file "/path/to/theme.toml"
 ///     trace_level "debug"
+///     layout "default"
 /// }
 /// ```
 #[derive(Debug, Clone)]
@@ -236,6 +237,13 @@ pub struct Config {
     ///
     /// Options: `trace`, `debug`, `info`, `warn`, `error`. Default: `"info"`
     pub trace_level: Option<String>,
+
+    /// Default layout to use for new sessions.
+    pub layout: Option<String>,
+
+    /// Whether to ignore predefined project/session-named layouts in ~/.config/zellij/layouts.
+    /// When true, this prevents automatic lookup of project-named layouts (e.g., {project_name}.kdl).
+    pub ignore_layouts: bool,
 }
 
 impl Default for Config {
@@ -246,6 +254,8 @@ impl Default for Config {
             theme_name: None,
             theme_file: None,
             trace_level: None,
+            layout: None,
+            ignore_layouts: false,
         }
     }
 }
@@ -268,6 +278,8 @@ impl Config {
     /// - `theme`: String → `Option<String>`
     /// - `theme_file`: String → `Option<String>`
     /// - `trace_level`: String → `Option<String>`
+    /// - `layout`: String → `Option<String>`
+    /// - `ignore_layouts`: String → `bool` (parses "true"/"false", defaults to false)
     ///
     /// # Example
     ///
@@ -278,10 +290,12 @@ impl Config {
     /// let mut map = BTreeMap::new();
     /// map.insert("scan_paths".to_string(), "~/Projects,~/Code".to_string());
     /// map.insert("scan_depth".to_string(), "5".to_string());
+    /// map.insert("ignore_layouts".to_string(), "true".to_string());
     ///
     /// let config = Config::from_zellij(map);
     /// assert_eq!(config.scan_paths, vec!["~/Projects", "~/Code"]);
     /// assert_eq!(config.scan_depth, 5);
+    /// assert!(config.ignore_layouts);
     /// ```
     #[must_use]
     pub fn from_zellij(config: &BTreeMap<String, String>) -> Self {
@@ -302,12 +316,19 @@ impl Config {
             .and_then(|s| s.parse::<u32>().ok())
             .unwrap_or(4);
 
+        let ignore_layouts = config
+            .get("ignore_layouts")
+            .map(|s| s.parse::<bool>().unwrap_or(false))
+            .unwrap_or(false);
+
         Self {
             scan_paths,
             scan_depth,
             theme_name: config.get("theme").cloned(),
             theme_file: config.get("theme_file").cloned(),
             trace_level: config.get("trace_level").cloned(),
+            layout: config.get("layout").cloned(),
+            ignore_layouts,
         }
     }
 }
