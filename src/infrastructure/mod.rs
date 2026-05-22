@@ -6,4 +6,4 @@
 
 pub mod paths;
 
-pub use paths::{expand_tilde, get_data_dir, strip_host_prefix};
+pub use paths::{expand_to_host_path, from_sandbox_path, get_data_dir, to_sandbox_path};
