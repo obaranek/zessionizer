@@ -236,6 +236,13 @@ pub struct Config {
     ///
     /// Options: `trace`, `debug`, `info`, `warn`, `error`. Default: `"info"`
     pub trace_level: Option<String>,
+
+    /// Default layout (KDL file path) used when a project has no
+    /// `.zessionizer.kdl` of its own.
+    ///
+    /// Resolved at session-open time via [`infrastructure::layout::resolve_for`].
+    /// If unset, an embedded built-in layout (single pane) is used.
+    pub default_project_layout: Option<String>,
 }
 
 impl Default for Config {
@@ -246,6 +253,7 @@ impl Default for Config {
             theme_name: None,
             theme_file: None,
             trace_level: None,
+            default_project_layout: None,
         }
     }
 }
@@ -308,6 +316,10 @@ impl Config {
             theme_name: config.get("theme").cloned(),
             theme_file: config.get("theme_file").cloned(),
             trace_level: config.get("trace_level").cloned(),
+            default_project_layout: config
+                .get("default_project_layout")
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
         }
     }
 }
@@ -370,4 +382,43 @@ pub fn initialize(config: &Config) -> AppState {
     );
 
     AppState::new(vec![], theme)
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+
+    fn config(pairs: &[(&str, &str)]) -> Config {
+        let map: BTreeMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        Config::from_zellij(&map)
+    }
+
+    #[test]
+    fn default_project_layout_is_none_when_unset() {
+        assert_eq!(config(&[]).default_project_layout, None);
+    }
+
+    #[test]
+    fn default_project_layout_is_parsed_when_set() {
+        let cfg = config(&[("default_project_layout", "~/.config/zellij/team.kdl")]);
+        assert_eq!(
+            cfg.default_project_layout.as_deref(),
+            Some("~/.config/zellij/team.kdl"),
+        );
+    }
+
+    #[test]
+    fn default_project_layout_trims_whitespace() {
+        let cfg = config(&[("default_project_layout", "  ~/team.kdl  ")]);
+        assert_eq!(cfg.default_project_layout.as_deref(), Some("~/team.kdl"));
+    }
+
+    #[test]
+    fn default_project_layout_empty_string_is_none() {
+        let cfg = config(&[("default_project_layout", "   ")]);
+        assert_eq!(cfg.default_project_layout, None);
+    }
 }

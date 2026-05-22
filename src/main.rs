@@ -81,7 +81,9 @@ use zellij_tile::shim::post_message_to;
 
 use zessionizer::worker::{WorkerMessage, WorkerResponse, ZessionizerWorker};
 use zessionizer::{
-    handle_event, infrastructure::expand_to_host_path, Action, Config, Event, InputMode,
+    handle_event,
+    infrastructure::{expand_to_host_path, from_host_path, layout, layout::BUILTIN_LAYOUT},
+    Action, Config, Event, InputMode,
 };
 
 // Register plugin and worker with Zellij
@@ -105,6 +107,11 @@ struct State {
     /// Configured scan depth (for `find` command).
     scan_depth: u32,
 
+    /// Optional path (user-visible form) to a default KDL layout used when a
+    /// project doesn't ship its own `.zessionizer.kdl`. Sourced from
+    /// `Config::default_project_layout`.
+    default_project_layout: Option<String>,
+
     /// Absolute host path that the sandbox `/host` mount corresponds to.
     ///
     /// Discovered once at plugin load via `get_plugin_ids().initial_cwd` and
@@ -122,6 +129,7 @@ impl Default for State {
             worker_name: "zessionizer".to_string(),
             scan_paths: Vec::new(),
             scan_depth: 4,
+            default_project_layout: None,
             host_home: PathBuf::from("/"),
         }
     }
@@ -186,6 +194,8 @@ impl ZellijPlugin for State {
 
         self.scan_paths.clone_from(&config.scan_paths);
         self.scan_depth = config.scan_depth;
+        self.default_project_layout
+            .clone_from(&config.default_project_layout);
 
         let plugin_ids = get_plugin_ids();
         tracing::debug!(
@@ -240,7 +250,7 @@ impl ZellijPlugin for State {
                 }
             }
             zellij_tile::prelude::Event::RunCommandResult(exit_code, stdout, stderr, _context) => {
-                Self::map_command_result_event(exit_code, stdout, stderr)
+                self.map_command_result_event(exit_code, stdout, stderr)
             }
             zellij_tile::prelude::Event::SessionUpdate(session_infos, _resurrectable_sessions) => {
                 Self::map_session_update_event(&session_infos)
@@ -427,12 +437,21 @@ impl State {
     }
 
     /// Maps run command result events to application events.
-    fn map_command_result_event(exit_code: Option<i32>, stdout: Vec<u8>, stderr: Vec<u8>) -> Event {
+    ///
+    /// `find` runs as a host process, so its output paths are absolute host
+    /// paths (e.g. `/Users/alice/Git/foo/.git`). Convert each back to user
+    /// form before handing them to the handler so downstream `~/`-aware
+    /// helpers (`to_sandbox_path`, layout/worktree filesystem checks) work
+    /// uniformly.
+    fn map_command_result_event(&self, exit_code: Option<i32>, stdout: Vec<u8>, stderr: Vec<u8>) -> Event {
         tracing::debug!(exit_code = ?exit_code, "run command result event");
 
         if exit_code == Some(0) {
             let output = String::from_utf8(stdout).unwrap_or_default();
-            let git_dirs: Vec<String> = output.lines().map(ToString::to_string).collect();
+            let git_dirs: Vec<String> = output
+                .lines()
+                .map(|line| from_host_path(line, &self.host_home))
+                .collect();
             tracing::debug!(
                 git_directory_count = git_dirs.len(),
                 "found git directories"
@@ -510,26 +529,29 @@ impl State {
                 tracing::debug!("closing plugin focus");
                 hide_self();
             }
-            Action::SwitchSession { ref name, ref path } => {
+            // `switch_session_with_layout` covers both create and switch:
+            // for a not-yet-running session it spawns one with the resolved
+            // layout; for an already-running session Zellij switches into it
+            // and ignores the layout (preserving the user's existing tabs).
+            Action::SwitchSession { ref name, ref path }
+            | Action::CreateSession { ref name, ref path } => {
                 let lossy = path.to_string_lossy();
                 let host_path = expand_to_host_path(&lossy, &self.host_home);
-                tracing::debug!(session = %name, stored_path = ?path, host_path = ?host_path, "switching to session");
+                let resolved =
+                    layout::resolve_for(&lossy, self.default_project_layout.as_deref());
+                tracing::debug!(
+                    session = %name,
+                    stored_path = ?path,
+                    host_path = ?host_path,
+                    layout = ?resolved,
+                    "opening session"
+                );
 
                 self.post_worker_message(&WorkerMessage::update_frecency(lossy.into_owned()));
                 self.post_worker_message(&WorkerMessage::load_projects(false));
 
-                switch_session_with_cwd(Some(name), Some(host_path));
-                hide_self();
-            }
-            Action::CreateSession { ref name, ref path } => {
-                let lossy = path.to_string_lossy();
-                let host_path = expand_to_host_path(&lossy, &self.host_home);
-                tracing::debug!(session = %name, stored_path = ?path, host_path = ?host_path, "creating new session");
-
-                self.post_worker_message(&WorkerMessage::update_frecency(lossy.into_owned()));
-                self.post_worker_message(&WorkerMessage::load_projects(false));
-
-                switch_session_with_cwd(Some(name), Some(host_path));
+                let layout_info = resolve_layout_info(resolved.as_deref(), &self.host_home);
+                switch_session_with_layout(Some(name), layout_info, Some(host_path));
                 hide_self();
             }
             Action::KillSession { ref name } => {
@@ -542,4 +564,24 @@ impl State {
             }
         }
     }
+}
+
+/// Maps an optional layout file path (in user-visible `~/...` form) to
+/// Zellij's `LayoutInfo`, expanding to an absolute host path before handing
+/// it to Zellij.
+///
+/// `None` resolves to the embedded built-in layout via `LayoutInfo::Stringified`,
+/// avoiding any temp-file management.
+fn resolve_layout_info(
+    layout: Option<&std::path::Path>,
+    host_home: &std::path::Path,
+) -> LayoutInfo {
+    layout.map_or_else(
+        || LayoutInfo::Stringified(BUILTIN_LAYOUT.to_string()),
+        |path| {
+            let lossy = path.to_string_lossy();
+            let host_path = expand_to_host_path(&lossy, host_home);
+            LayoutInfo::File(host_path.to_string_lossy().into_owned())
+        },
+    )
 }

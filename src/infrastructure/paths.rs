@@ -67,6 +67,32 @@ pub fn from_sandbox_path(path: &str) -> String {
     path.to_string()
 }
 
+/// Converts an absolute host path back to its user-visible (`~/...`) form by
+/// stripping the host's home-directory prefix. Paths that don't sit under
+/// `host_home` are returned unchanged.
+///
+/// This is the inverse of [`expand_to_host_path`]'s `~/` branch and is used
+/// to normalize `find` output (which produces absolute host paths because the
+/// `find` process runs outside the WASI sandbox) before paths flow through
+/// the rest of the system.
+#[must_use]
+pub fn from_host_path(path: &str, host_home: &Path) -> String {
+    let host_home_str = host_home.to_string_lossy();
+    let trimmed = host_home_str.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return path.to_string();
+    }
+    if path == trimmed {
+        return TILDE.to_string();
+    }
+    if let Some(rest) = path.strip_prefix(trimmed) {
+        if let Some(suffix) = rest.strip_prefix('/') {
+            return format!("{TILDE_PREFIX}{suffix}");
+        }
+    }
+    path.to_string()
+}
+
 /// Resolves a user-visible path against the host's home directory, producing
 /// an absolute host path suitable for Zellij APIs that execute outside the
 /// sandbox.
@@ -208,5 +234,33 @@ mod tests {
             expand_to_host_path("/hostile", home),
             PathBuf::from("/hostile"),
         );
+    }
+
+    #[test]
+    fn from_host_strips_home_prefix() {
+        let home = Path::new("/Users/alice");
+        assert_eq!(from_host_path("/Users/alice/Git/foo", home), "~/Git/foo");
+        assert_eq!(from_host_path("/Users/alice", home), "~");
+    }
+
+    #[test]
+    fn from_host_handles_trailing_slash_in_home() {
+        let home = Path::new("/Users/alice/");
+        assert_eq!(from_host_path("/Users/alice/Git/foo", home), "~/Git/foo");
+        assert_eq!(from_host_path("/Users/alice", home), "~");
+    }
+
+    #[test]
+    fn from_host_passes_through_unrelated_paths() {
+        let home = Path::new("/Users/alice");
+        assert_eq!(from_host_path("/etc/hosts", home), "/etc/hosts");
+        assert_eq!(from_host_path("~/already-user", home), "~/already-user");
+    }
+
+    #[test]
+    fn from_host_does_not_match_partial_prefix() {
+        let home = Path::new("/Users/al");
+        // "/Users/alice/X" must not be matched against "/Users/al" + "ice/X".
+        assert_eq!(from_host_path("/Users/alice/Git", home), "/Users/alice/Git");
     }
 }
