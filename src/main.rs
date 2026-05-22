@@ -420,6 +420,16 @@ impl State {
                     tracing::debug!("triggering initial filesystem scan");
                     self.trigger_filesystem_scan();
                 }
+
+                // Prime Zellij's `peer_sessions_cache` before the first
+                // auto-emitted `SessionUpdate` arrives, so it already contains
+                // the full list rather than just the current session. This
+                // avoids the brief "only my own session" flash that would
+                // otherwise be visible until the first Timer tick replaces it.
+                if let Err(e) = get_session_list() {
+                    tracing::debug!(error = %e, "initial get_session_list failed; falling back to timer refresh");
+                }
+
                 tracing::debug!("arming session refresh timer");
                 set_timeout(Self::SESSION_REFRESH_INTERVAL_SECS);
             }
