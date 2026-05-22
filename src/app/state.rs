@@ -40,9 +40,10 @@
 //! let viewmodel = state.compute_viewmodel(24, 80);
 //! ```
 
+use super::modes::{InputMode, ViewMode};
+use crate::domain::worktree::Worktree;
 use crate::domain::Project;
 use crate::ui::theme::Theme;
-use super::modes::{InputMode, ViewMode};
 use std::collections::HashSet;
 use fuzzy_matcher::skim::SkimMatcherV2;
 
@@ -106,6 +107,34 @@ pub struct AppState {
     /// Updated by `SessionUpdate` events. Used to filter out the current session
     /// from the Sessions view.
     pub current_session: Option<String>,
+
+    /// Trunk + sibling worktrees of the project currently being drilled into.
+    ///
+    /// Populated by `SelectProject` when the chosen project has a
+    /// `.worktrees/` directory and reset when the user navigates back. Empty
+    /// outside of [`ViewMode::Worktrees`].
+    pub worktrees: Vec<Worktree>,
+
+    /// Subset of `worktrees` that matches the current search query.
+    pub filtered_worktrees: Vec<Worktree>,
+
+    /// Bookkeeping for the active worktrees drilldown.
+    pub worktrees_context: Option<WorktreesContext>,
+}
+
+/// Captures the project whose worktrees the user is currently browsing, plus
+/// the view they came from so `b` can put them back where they were.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreesContext {
+    /// Display name of the project (also used as the session name when
+    /// opening any of its worktrees).
+    pub project_name: String,
+
+    /// User-visible path to the project root.
+    pub project_path: String,
+
+    /// View the user was on before drilling into worktrees.
+    pub previous_view: ViewMode,
 }
 
 impl AppState {
@@ -144,6 +173,9 @@ impl AppState {
             theme,
             active_sessions: HashSet::new(),
             current_session: None,
+            worktrees: vec![],
+            filtered_worktrees: vec![],
+            worktrees_context: None,
         }
     }
 
@@ -160,10 +192,11 @@ impl AppState {
     /// state.move_selection_down();
     /// ```
     pub fn move_selection_down(&mut self) {
-        if self.filtered_projects.is_empty() {
+        let len = self.active_list_len();
+        if len == 0 {
             return;
         }
-        self.selected_index = (self.selected_index + 1) % self.filtered_projects.len();
+        self.selected_index = (self.selected_index + 1) % len;
     }
 
     /// Moves selection cursor up by one position, wrapping to bottom if at start.
@@ -179,14 +212,33 @@ impl AppState {
     /// state.move_selection_up();
     /// ```
     pub fn move_selection_up(&mut self) {
-        if self.filtered_projects.is_empty() {
+        let len = self.active_list_len();
+        if len == 0 {
             return;
         }
         if self.selected_index == 0 {
-            self.selected_index = self.filtered_projects.len() - 1;
+            self.selected_index = len - 1;
         } else {
             self.selected_index -= 1;
         }
+    }
+
+    /// Returns the length of the list currently driving the picker, depending
+    /// on the active view mode.
+    #[must_use]
+    pub fn active_list_len(&self) -> usize {
+        match self.view_mode {
+            ViewMode::Worktrees => self.filtered_worktrees.len(),
+            ViewMode::Sessions | ViewMode::ProjectsWithoutSessions => self.filtered_projects.len(),
+        }
+    }
+
+    /// Returns a reference to the currently selected worktree, if any.
+    ///
+    /// Only meaningful when `view_mode` is [`ViewMode::Worktrees`].
+    #[must_use]
+    pub fn selected_worktree(&self) -> Option<&Worktree> {
+        self.filtered_worktrees.get(self.selected_index)
     }
 
     /// Returns a reference to the currently selected project, if any.
@@ -264,32 +316,57 @@ impl AppState {
             Some(SkimMatcherV2::default())
         };
 
-        let filtered_iter = self.projects.iter().filter(|project| {
-            let passes_view_mode = match self.view_mode {
-                ViewMode::Sessions => self.active_sessions.contains(&project.name),
-                ViewMode::ProjectsWithoutSessions => !self.active_sessions.contains(&project.name),
-            };
+        if matches!(self.view_mode, ViewMode::Worktrees) {
+            let filtered: Vec<Worktree> = self
+                .worktrees
+                .iter()
+                .filter(|wt| {
+                    matcher.as_ref().map_or(true, |m| {
+                        let name_lower = wt.name.to_lowercase();
+                        tokens
+                            .iter()
+                            .all(|token| m.fuzzy_match(&name_lower, token).is_some())
+                    })
+                })
+                .cloned()
+                .collect();
 
-            if !passes_view_mode {
-                return false;
-            }
+            self.filtered_worktrees = filtered;
+            self.filtered_projects = vec![];
+        } else {
+            let filtered_iter = self.projects.iter().filter(|project| {
+                let passes_view_mode = match self.view_mode {
+                    ViewMode::Sessions => self.active_sessions.contains(&project.name),
+                    ViewMode::ProjectsWithoutSessions => {
+                        !self.active_sessions.contains(&project.name)
+                    }
+                    ViewMode::Worktrees => unreachable!(),
+                };
 
-            matcher.as_ref().map_or(true, |m| {
-                let name_lower = project.name.to_lowercase();
-                tokens.iter().all(|token| m.fuzzy_match(&name_lower, token).is_some())
-            })
-        });
+                if !passes_view_mode {
+                    return false;
+                }
 
-        self.filtered_projects = filtered_iter.cloned().collect();
+                matcher.as_ref().map_or(true, |m| {
+                    let name_lower = project.name.to_lowercase();
+                    tokens.iter().all(|token| m.fuzzy_match(&name_lower, token).is_some())
+                })
+            });
 
-        if self.filtered_projects.is_empty() {
+            self.filtered_projects = filtered_iter.cloned().collect();
+            self.filtered_worktrees = vec![];
+        }
+
+        let len = self.active_list_len();
+        if len == 0 {
             self.selected_index = 0;
         } else {
-            self.selected_index = self.selected_index.min(self.filtered_projects.len() - 1);
+            self.selected_index = self.selected_index.min(len - 1);
         }
 
         tracing::debug!(
-            filtered_count = self.filtered_projects.len(),
+            filtered_projects = self.filtered_projects.len(),
+            filtered_worktrees = self.filtered_worktrees.len(),
             "search filter applied"
         );
     }
@@ -327,7 +404,9 @@ impl AppState {
     /// ```
     #[must_use]
     pub fn compute_viewmodel(&self, rows: usize, cols: usize) -> crate::ui::viewmodel::UIViewModel {
-        if self.projects.is_empty() || self.filtered_projects.is_empty() {
+        let total_count = self.active_list_len();
+
+        if total_count == 0 {
             return crate::ui::viewmodel::UIViewModel {
                 display_items: vec![],
                 selected_index: 0,
@@ -341,27 +420,41 @@ impl AppState {
         let available_rows = self.calculate_available_rows(rows);
 
         let mut visible_start = self.selected_index.saturating_sub(available_rows / 2);
-        let visible_end = (visible_start + available_rows).min(self.filtered_projects.len());
+        let visible_end = (visible_start + available_rows).min(total_count);
 
         let actual_count = visible_end - visible_start;
-        if actual_count < available_rows && self.filtered_projects.len() >= available_rows {
+        if actual_count < available_rows && total_count >= available_rows {
             visible_start = visible_end.saturating_sub(available_rows);
         }
 
-        let matcher = if matches!(self.input_mode, InputMode::Search(_)) && !self.search_query.is_empty() {
+        let matcher = if matches!(self.input_mode, InputMode::Search(_))
+            && !self.search_query.is_empty()
+        {
             Some(SkimMatcherV2::default())
         } else {
             None
         };
 
-        let display_items: Vec<crate::ui::viewmodel::DisplayItem> = self.filtered_projects[visible_start..visible_end]
-            .iter()
-            .enumerate()
-            .map(|(relative_idx, project)| {
-                let absolute_idx = visible_start + relative_idx;
-                self.compute_display_item(project, absolute_idx, cols, matcher.as_ref())
-            })
-            .collect();
+        let display_items: Vec<crate::ui::viewmodel::DisplayItem> =
+            if matches!(self.view_mode, ViewMode::Worktrees) {
+                self.filtered_worktrees[visible_start..visible_end]
+                    .iter()
+                    .enumerate()
+                    .map(|(relative_idx, worktree)| {
+                        let absolute_idx = visible_start + relative_idx;
+                        self.compute_worktree_display_item(worktree, absolute_idx, cols, matcher.as_ref())
+                    })
+                    .collect()
+            } else {
+                self.filtered_projects[visible_start..visible_end]
+                    .iter()
+                    .enumerate()
+                    .map(|(relative_idx, project)| {
+                        let absolute_idx = visible_start + relative_idx;
+                        self.compute_display_item(project, absolute_idx, cols, matcher.as_ref())
+                    })
+                    .collect()
+            };
 
         let selected_display_index = self.selected_index.saturating_sub(visible_start);
 
@@ -372,6 +465,40 @@ impl AppState {
             footer: self.compute_footer(),
             empty_state: None,
             search_bar: self.compute_search_bar(),
+        }
+    }
+
+    /// Renders a single worktree row.
+    fn compute_worktree_display_item(
+        &self,
+        worktree: &Worktree,
+        absolute_idx: usize,
+        cols: usize,
+        matcher: Option<&SkimMatcherV2>,
+    ) -> crate::ui::viewmodel::DisplayItem {
+        const NAME_COLUMN_WIDTH: usize = 37;
+        const SAFETY_MARGIN: usize = 2;
+
+        let is_selected = absolute_idx == self.selected_index;
+        let max_path_width = cols.saturating_sub(NAME_COLUMN_WIDTH + SAFETY_MARGIN);
+
+        let name = if worktree.name.len() > 35 {
+            format!("{}...", &worktree.name[..32])
+        } else {
+            worktree.name.clone()
+        };
+
+        let path = Self::format_display_path(&worktree.path, max_path_width);
+
+        let highlight_ranges =
+            matcher.map_or_else(Vec::new, |m| self.compute_highlight_ranges(&worktree.name, m));
+
+        crate::ui::viewmodel::DisplayItem {
+            name,
+            path,
+            is_selected,
+            is_current_session: false,
+            highlight_ranges,
         }
     }
 
@@ -483,13 +610,23 @@ impl AppState {
     ///
     /// A [`HeaderInfo`](crate::ui::viewmodel::HeaderInfo) with formatted title string.
     fn compute_header(&self) -> crate::ui::viewmodel::HeaderInfo {
-        let (view_name, count) = match self.view_mode {
-            ViewMode::Sessions => ("Active Sessions", self.filtered_projects.len()),
-            ViewMode::ProjectsWithoutSessions => ("All Projects", self.filtered_projects.len()),
+        let title = match self.view_mode {
+            ViewMode::Sessions => format!(" Active Sessions ({}) ", self.filtered_projects.len()),
+            ViewMode::ProjectsWithoutSessions => {
+                format!(" All Projects ({}) ", self.filtered_projects.len())
+            }
+            ViewMode::Worktrees => {
+                let project = self
+                    .worktrees_context
+                    .as_ref()
+                    .map_or("?", |c| c.project_name.as_str());
+                format!(
+                    " Worktrees of {project} ({}) ",
+                    self.filtered_worktrees.len()
+                )
+            }
         };
-        crate::ui::viewmodel::HeaderInfo {
-            title: format!(" {view_name} ({count}) "),
-        }
+        crate::ui::viewmodel::HeaderInfo { title }
     }
 
     /// Computes footer keybindings text based on current input and view modes.
@@ -514,6 +651,9 @@ impl AppState {
             }
             (InputMode::Normal, ViewMode::ProjectsWithoutSessions) => {
                 "j/k or Ctrl+n/p: navigate  /: search  s: sessions  Enter: create  q: quit".to_string()
+            }
+            (InputMode::Normal, ViewMode::Worktrees) => {
+                "j/k or Ctrl+n/p: navigate  /: search  Enter: open  b: back  q: quit".to_string()
             }
         };
 
