@@ -472,12 +472,20 @@ mod tests {
         }
     }
 
+    fn empty_state() -> AppState {
+        AppState::new(vec![], Theme::default())
+    }
+
+    fn scan_event(markers: &[&str]) -> Event {
+        Event::ProjectsScanned {
+            git_directories: markers.iter().map(|s| (*s).to_string()).collect(),
+        }
+    }
+
     #[test]
     fn projects_scanned_strips_marker_and_uses_user_paths() {
-        let mut state = AppState::new(vec![], Theme::default());
-        let event = Event::ProjectsScanned {
-            git_directories: vec!["/host/Projects/foo/.git".to_string()],
-        };
+        let mut state = empty_state();
+        let event = scan_event(&["/host/Projects/foo/.git"]);
 
         let (_, actions) = handle_event(&mut state, &event).unwrap();
         let projects = extract_batch(&actions);
@@ -490,13 +498,11 @@ mod tests {
 
     #[test]
     fn projects_scanned_dedups_repos_with_both_markers() {
-        let mut state = AppState::new(vec![], Theme::default());
-        let event = Event::ProjectsScanned {
-            git_directories: vec![
-                "/host/Projects/foo/.git".to_string(),
-                "/host/Projects/foo/.zessionizer".to_string(),
-            ],
-        };
+        let mut state = empty_state();
+        let event = scan_event(&[
+            "/host/Projects/foo/.git",
+            "/host/Projects/foo/.zessionizer",
+        ]);
 
         let (_, actions) = handle_event(&mut state, &event).unwrap();
         let projects = extract_batch(&actions);
@@ -507,13 +513,8 @@ mod tests {
 
     #[test]
     fn projects_scanned_keeps_distinct_paths_with_same_basename() {
-        let mut state = AppState::new(vec![], Theme::default());
-        let event = Event::ProjectsScanned {
-            git_directories: vec![
-                "/host/Projects/foo/.git".to_string(),
-                "/host/Code/foo/.git".to_string(),
-            ],
-        };
+        let mut state = empty_state();
+        let event = scan_event(&["/host/Projects/foo/.git", "/host/Code/foo/.git"]);
 
         let (_, actions) = handle_event(&mut state, &event).unwrap();
         let projects = extract_batch(&actions);
@@ -526,10 +527,8 @@ mod tests {
 
     #[test]
     fn projects_scanned_emits_no_action_when_empty() {
-        let mut state = AppState::new(vec![], Theme::default());
-        let event = Event::ProjectsScanned {
-            git_directories: vec![],
-        };
+        let mut state = empty_state();
+        let event = scan_event(&[]);
 
         let (_, actions) = handle_event(&mut state, &event).unwrap();
         assert!(actions.is_empty());

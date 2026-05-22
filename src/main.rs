@@ -75,12 +75,13 @@
 #![allow(clippy::multiple_crate_versions)]
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use zellij_tile::prelude::*;
 use zellij_tile::shim::post_message_to;
 
 use zessionizer::worker::{WorkerMessage, WorkerResponse, ZessionizerWorker};
 use zessionizer::{
-    handle_event, infrastructure::to_sandbox_path, Action, Config, Event, InputMode,
+    handle_event, infrastructure::expand_to_host_path, Action, Config, Event, InputMode,
 };
 
 // Register plugin and worker with Zellij
@@ -103,6 +104,14 @@ struct State {
 
     /// Configured scan depth (for `find` command).
     scan_depth: u32,
+
+    /// Absolute host path that the sandbox `/host` mount corresponds to.
+    ///
+    /// Discovered once at plugin load via `get_plugin_ids().initial_cwd` and
+    /// used to expand `~/` and `/host/`-prefixed cwd paths into absolute
+    /// host paths before they're handed to Zellij APIs (which run outside
+    /// the sandbox and don't perform tilde or `/host/` expansion).
+    host_home: PathBuf,
 }
 
 impl Default for State {
@@ -113,6 +122,7 @@ impl Default for State {
             worker_name: "zessionizer".to_string(),
             scan_paths: Vec::new(),
             scan_depth: 4,
+            host_home: PathBuf::from("/"),
         }
     }
 }
@@ -176,6 +186,13 @@ impl ZellijPlugin for State {
 
         self.scan_paths.clone_from(&config.scan_paths);
         self.scan_depth = config.scan_depth;
+
+        let plugin_ids = get_plugin_ids();
+        tracing::debug!(
+            initial_cwd = %plugin_ids.initial_cwd.display(),
+            "captured host home directory"
+        );
+        self.host_home = plugin_ids.initial_cwd;
 
         tracing::debug!("plugin load complete - waiting for permissions");
     }
@@ -284,17 +301,20 @@ impl State {
             "running find command to scan for .git directories and .zessionizer marker files"
         );
 
-        for scan_path in &self.scan_paths {
-            let sandbox_path = to_sandbox_path(scan_path);
+        let max_depth = self.scan_depth.to_string();
 
-            tracing::debug!(scan_path = %scan_path, sandbox_path = %sandbox_path, "scanning path");
+        for scan_path in &self.scan_paths {
+            let host_path = expand_to_host_path(scan_path, &self.host_home);
+            let host_path_str = host_path.to_string_lossy();
+
+            tracing::debug!(scan_path = %scan_path, host_path = %host_path_str, "scanning path");
 
             run_command(
                 &[
                     "find",
-                    &sandbox_path,
+                    &host_path_str,
                     "-maxdepth",
-                    &self.scan_depth.to_string(),
+                    &max_depth,
                     "(",
                     "-name",
                     ".git",
@@ -491,23 +511,25 @@ impl State {
                 hide_self();
             }
             Action::SwitchSession { ref name, ref path } => {
-                tracing::debug!(session = %name, path = ?path, "switching to session");
+                let lossy = path.to_string_lossy();
+                let host_path = expand_to_host_path(&lossy, &self.host_home);
+                tracing::debug!(session = %name, stored_path = ?path, host_path = ?host_path, "switching to session");
 
-                let path_str = path.to_string_lossy().to_string();
-                self.post_worker_message(&WorkerMessage::update_frecency(path_str));
+                self.post_worker_message(&WorkerMessage::update_frecency(lossy.into_owned()));
                 self.post_worker_message(&WorkerMessage::load_projects(false));
 
-                switch_session_with_cwd(Some(name), Some(path.clone()));
+                switch_session_with_cwd(Some(name), Some(host_path));
                 hide_self();
             }
             Action::CreateSession { ref name, ref path } => {
-                tracing::debug!(session = %name, path = ?path, "creating new session");
+                let lossy = path.to_string_lossy();
+                let host_path = expand_to_host_path(&lossy, &self.host_home);
+                tracing::debug!(session = %name, stored_path = ?path, host_path = ?host_path, "creating new session");
 
-                let path_str = path.to_string_lossy().to_string();
-                self.post_worker_message(&WorkerMessage::update_frecency(path_str));
+                self.post_worker_message(&WorkerMessage::update_frecency(lossy.into_owned()));
                 self.post_worker_message(&WorkerMessage::load_projects(false));
 
-                switch_session_with_cwd(Some(name), Some(path.clone()));
+                switch_session_with_cwd(Some(name), Some(host_path));
                 hide_self();
             }
             Action::KillSession { ref name } => {

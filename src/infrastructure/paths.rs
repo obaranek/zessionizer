@@ -5,11 +5,26 @@
 //! focused terminal pane (or the directory Zellij was launched from), which
 //! is typically the user's home directory.
 //!
-//! User-facing paths use the conventional `~/` prefix; in-sandbox paths used
-//! when invoking host commands (notably `find`) must use the `/host/` prefix.
-//! The helpers below convert between the two forms.
+//! Three path forms appear in this codebase:
+//! - **User-visible** (`~/Projects/foo`): how paths are stored and displayed.
+//! - **Sandbox** (`/host/Projects/foo`): used when invoking host commands
+//!   (notably `find`) and when the plugin reads/writes the host filesystem.
+//! - **Absolute host** (`/Users/alice/Projects/foo`): required by Zellij APIs
+//!   that run *outside* the sandbox (notably `switch_session_with_layout`,
+//!   which receives the cwd via the protobuf bridge and resolves it on the
+//!   host -- where `~` and `/host` are both meaningless).
+//!
+//! [`to_sandbox_path`] and [`from_sandbox_path`] swap between the first two.
+//! [`expand_to_host_path`] takes a user-visible path and the host's home
+//! directory (sourced once at plugin load via `get_plugin_ids().initial_cwd`)
+//! and produces the third.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+const TILDE: &str = "~";
+const TILDE_PREFIX: &str = "~/";
+const SANDBOX_ROOT: &str = "/host";
+const SANDBOX_PREFIX: &str = "/host/";
 
 /// Returns the data directory for Zessionizer storage.
 ///
@@ -22,15 +37,18 @@ pub fn get_data_dir() -> PathBuf {
 
 /// Converts a user-visible path (`~/...`) to its in-sandbox form (`/host/...`).
 ///
-/// Paths that are already absolute (or that don't begin with `~`) are returned
-/// unchanged.
+/// Paths that don't begin with `~` are returned unchanged. Note that this
+/// means **bare relative paths like `Projects/foo`** are passed through as-is;
+/// `find Projects/foo` will only resolve when the sandbox cwd happens to be
+/// the host's home. Configure `scan_paths` with leading `~/` (or absolute
+/// paths) to be explicit.
 #[must_use]
 pub fn to_sandbox_path(path: &str) -> String {
-    if path == "~" {
-        return "/host".to_string();
+    if path == TILDE {
+        return SANDBOX_ROOT.to_string();
     }
-    if let Some(rest) = path.strip_prefix("~/") {
-        return format!("/host/{rest}");
+    if let Some(rest) = path.strip_prefix(TILDE_PREFIX) {
+        return format!("{SANDBOX_PREFIX}{rest}");
     }
     path.to_string()
 }
@@ -40,18 +58,51 @@ pub fn to_sandbox_path(path: &str) -> String {
 /// Paths that aren't under `/host` are returned unchanged.
 #[must_use]
 pub fn from_sandbox_path(path: &str) -> String {
-    if path == "/host" {
-        return "~".to_string();
+    if path == SANDBOX_ROOT {
+        return TILDE.to_string();
     }
-    if let Some(rest) = path.strip_prefix("/host/") {
-        return format!("~/{rest}");
+    if let Some(rest) = path.strip_prefix(SANDBOX_PREFIX) {
+        return format!("{TILDE_PREFIX}{rest}");
     }
     path.to_string()
+}
+
+/// Resolves a user-visible path against the host's home directory, producing
+/// an absolute host path suitable for Zellij APIs that execute outside the
+/// sandbox.
+///
+/// `host_home` should be the value of `get_plugin_ids().initial_cwd` -- the
+/// directory that maps to `/host` inside the sandbox. The conversions are:
+///
+/// | Input               | Output                          |
+/// |---------------------|---------------------------------|
+/// | `~`                 | `<host_home>`                   |
+/// | `~/Projects/foo`    | `<host_home>/Projects/foo`      |
+/// | `/host`             | `<host_home>`                   |
+/// | `/host/Projects/x`  | `<host_home>/Projects/x`        |
+/// | `/Users/alice/...`  | unchanged (already absolute)    |
+/// | `Projects/foo`      | `<host_home>/Projects/foo`      |
+#[must_use]
+pub fn expand_to_host_path(path: &str, host_home: &Path) -> PathBuf {
+    if path == TILDE || path == SANDBOX_ROOT {
+        return host_home.to_path_buf();
+    }
+    if let Some(rest) = path
+        .strip_prefix(TILDE_PREFIX)
+        .or_else(|| path.strip_prefix(SANDBOX_PREFIX))
+    {
+        return host_home.join(rest);
+    }
+    if path.starts_with('/') {
+        return PathBuf::from(path);
+    }
+    host_home.join(path)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     #[test]
     fn to_sandbox_expands_tilde_with_subpath() {
@@ -103,5 +154,59 @@ mod tests {
         for input in ["~/Projects", "~/Projects/foo/bar", "~"] {
             assert_eq!(from_sandbox_path(&to_sandbox_path(input)), input);
         }
+    }
+
+    #[test]
+    fn expand_resolves_tilde_form() {
+        let home = Path::new("/Users/alice");
+        assert_eq!(
+            expand_to_host_path("~/Projects/foo", home),
+            PathBuf::from("/Users/alice/Projects/foo"),
+        );
+        assert_eq!(expand_to_host_path("~", home), PathBuf::from("/Users/alice"));
+    }
+
+    #[test]
+    fn expand_resolves_sandbox_form() {
+        let home = Path::new("/Users/alice");
+        assert_eq!(
+            expand_to_host_path("/host/Projects/foo", home),
+            PathBuf::from("/Users/alice/Projects/foo"),
+        );
+        assert_eq!(
+            expand_to_host_path("/host", home),
+            PathBuf::from("/Users/alice"),
+        );
+    }
+
+    #[test]
+    fn expand_passes_through_absolute_host_paths() {
+        let home = Path::new("/Users/alice");
+        assert_eq!(
+            expand_to_host_path("/etc/hosts", home),
+            PathBuf::from("/etc/hosts"),
+        );
+    }
+
+    #[test]
+    fn expand_treats_relative_as_relative_to_home() {
+        // Legacy projects.json entries (pre-rebuild) stored paths like
+        // `Projects/foo` after the old strip_prefix. Treat them as
+        // home-relative so anyone migrating doesn't get a broken cwd.
+        let home = Path::new("/Users/alice");
+        assert_eq!(
+            expand_to_host_path("Projects/foo", home),
+            PathBuf::from("/Users/alice/Projects/foo"),
+        );
+    }
+
+    #[test]
+    fn expand_does_not_strip_partial_host_match() {
+        let home = Path::new("/Users/alice");
+        // "/hostile" must not be rewritten as "/Users/alice/ile".
+        assert_eq!(
+            expand_to_host_path("/hostile", home),
+            PathBuf::from("/hostile"),
+        );
     }
 }
