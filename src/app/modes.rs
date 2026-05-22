@@ -74,4 +74,10 @@ pub enum ViewMode {
     ///
     /// Header displays "All Projects". Available actions: create session.
     ProjectsWithoutSessions,
+
+    /// Shows the trunk + sibling worktrees of a single project.
+    ///
+    /// Reached by pressing `Enter` on a project that has a `.worktrees/`
+    /// directory. `b` returns to the previous projects view.
+    Worktrees,
 }

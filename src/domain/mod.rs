@@ -25,6 +25,8 @@
 
 pub mod error;
 pub mod project;
+pub mod worktree;
 
 pub use error::{Result, ZessionizerError};
 pub use project::Project;
+pub use worktree::Worktree;
