@@ -190,6 +190,7 @@ impl ZellijPlugin for State {
             EventType::FileSystemCreate,
             EventType::FileSystemUpdate,
             EventType::FileSystemDelete,
+            EventType::Timer,
         ]);
 
         self.scan_paths.clone_from(&config.scan_paths);
@@ -254,6 +255,16 @@ impl ZellijPlugin for State {
             }
             zellij_tile::prelude::Event::SessionUpdate(session_infos, _resurrectable_sessions) => {
                 Self::map_session_update_event(&session_infos)
+            }
+            zellij_tile::prelude::Event::Timer(_) => {
+                set_timeout(Self::SESSION_REFRESH_INTERVAL_SECS);
+                match get_session_list() {
+                    Ok(snapshot) => Self::map_session_update_event(&snapshot.live_sessions),
+                    Err(e) => {
+                        tracing::debug!(error = %e, "get_session_list failed; skipping refresh");
+                        return false;
+                    }
+                }
             }
             zellij_tile::prelude::Event::FileSystemCreate(paths)
             | zellij_tile::prelude::Event::FileSystemUpdate(paths)
@@ -349,6 +360,7 @@ impl State {
             zellij_tile::prelude::Event::CustomMessage(msg, _) => format!("CustomMessage({msg})"),
             zellij_tile::prelude::Event::RunCommandResult(..) => "RunCommandResult".to_string(),
             zellij_tile::prelude::Event::SessionUpdate(..) => "SessionUpdate".to_string(),
+            zellij_tile::prelude::Event::Timer(..) => "Timer".to_string(),
             zellij_tile::prelude::Event::PermissionRequestResult(..) => {
                 "PermissionRequestResult".to_string()
             }
@@ -408,6 +420,8 @@ impl State {
                     tracing::debug!("triggering initial filesystem scan");
                     self.trigger_filesystem_scan();
                 }
+                tracing::debug!("arming session refresh timer");
+                set_timeout(Self::SESSION_REFRESH_INTERVAL_SECS);
             }
             PermissionStatus::Denied => {
                 tracing::warn!("permissions denied - plugin functionality limited");
@@ -479,6 +493,18 @@ impl State {
             current_session,
         }
     }
+
+    /// Polling interval for the session list refresh timer.
+    ///
+    /// Zellij's auto-emitted `SessionUpdate` event only delivers the *current*
+    /// session's info to each plugin instance unless a plugin has explicitly
+    /// called [`get_session_list`] -- which side-effects the host's
+    /// `peer_sessions_cache` so subsequent auto-emits also see the full list.
+    ///
+    /// We poll on a short interval to keep the picker fresh as sessions come
+    /// and go elsewhere on the host. Matches the cadence the built-in
+    /// `session-manager` plugin uses.
+    const SESSION_REFRESH_INTERVAL_SECS: f64 = 1.0;
 
     /// Posts a message to the worker thread.
     ///
@@ -556,7 +582,7 @@ impl State {
             }
             Action::KillSession { ref name } => {
                 tracing::debug!(session = %name, "killing session");
-                kill_sessions(&[name]);
+                let _ = kill_sessions(&[name]);
             }
             Action::PostToWorker(ref message) => {
                 tracing::debug!(message = ?message, "posting message to worker");
@@ -581,7 +607,8 @@ fn resolve_layout_info(
         |path| {
             let lossy = path.to_string_lossy();
             let host_path = expand_to_host_path(&lossy, host_home);
-            LayoutInfo::File(host_path.to_string_lossy().into_owned())
+            let metadata = LayoutMetadata::from(&host_path);
+            LayoutInfo::File(host_path.to_string_lossy().into_owned(), metadata)
         },
     )
 }
