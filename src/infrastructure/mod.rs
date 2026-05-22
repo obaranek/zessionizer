@@ -6,5 +6,6 @@
 
 pub mod layout;
 pub mod paths;
+pub mod worktree;
 
 pub use paths::{expand_to_host_path, from_host_path, from_sandbox_path, get_data_dir, to_sandbox_path};
