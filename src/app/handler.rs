@@ -35,6 +35,7 @@
 
 use crate::app::{Action, AppState};
 use crate::domain::error::Result;
+use crate::infrastructure::from_sandbox_path;
 use crate::worker::{WorkerMessage, WorkerResponse};
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -299,17 +300,26 @@ pub fn handle_event(state: &mut AppState, event: &Event) -> Result<(bool, Vec<Ac
                 return Ok((false, vec![]));
             }
 
-            state.selected_project().map_or_else(|| {
-                tracing::debug!("no session selected to kill");
-                Ok((false, vec![]))
-            }, |project| {
-                tracing::debug!(session_name = %project.name, "killing session");
-                Ok((false, vec![Action::KillSession {
-                    name: project.name.clone()
-                }]))
-            })
+            state.selected_project().map_or_else(
+                || {
+                    tracing::debug!("no session selected to kill");
+                    Ok((false, vec![]))
+                },
+                |project| {
+                    tracing::debug!(session_name = %project.name, "killing session");
+                    Ok((
+                        false,
+                        vec![Action::KillSession {
+                            name: project.name.clone(),
+                        }],
+                    ))
+                },
+            )
         }
-        Event::SessionUpdate { active_sessions, current_session } => {
+        Event::SessionUpdate {
+            active_sessions,
+            current_session,
+        } => {
             let mut actions = vec![];
 
             let added_count = active_sessions.difference(&state.active_sessions).count();
@@ -330,9 +340,9 @@ pub fn handle_event(state: &mut AppState, event: &Event) -> Result<(bool, Vec<Ac
                 state.current_session.clone_from(current_session);
 
                 let session_names: Vec<String> = active_sessions.iter().cloned().collect();
-                actions.push(Action::PostToWorker(
-                    WorkerMessage::sync_sessions(session_names)
-                ));
+                actions.push(Action::PostToWorker(WorkerMessage::sync_sessions(
+                    session_names,
+                )));
 
                 state.apply_search_filter();
                 Ok((true, actions))
@@ -347,40 +357,49 @@ pub fn handle_event(state: &mut AppState, event: &Event) -> Result<(bool, Vec<Ac
                 "projects scan completed"
             );
 
-            // Extract project directories by stripping marker suffixes
-            // (/.git or /.zessionizer) from the paths returned by find
-            let projects: Vec<(String, String)> = git_directories
-                .iter()
-                .map(|marker_path| {
-                    let without_host = marker_path.strip_prefix("/host").unwrap_or(marker_path);
-                    let project_path = without_host
-                        .strip_suffix("/.git")
-                        .or_else(|| without_host.strip_suffix("/.zessionizer"))
-                        .unwrap_or(without_host);
+            // Strip the marker suffix (`/.git` or `/.zessionizer`) and convert
+            // the in-sandbox `/host/...` form back to the user-visible `~/...`
+            // form. Two markers in the same project (e.g. a repo that also has
+            // a `.zessionizer` file) collapse to a single entry via dedup.
+            let mut seen: HashSet<String> = HashSet::new();
+            let mut projects: Vec<(String, String)> = Vec::with_capacity(git_directories.len());
 
-                    let project_name = project_path
-                        .split('/')
-                        .next_back()
-                        .unwrap_or("unknown");
+            for marker_path in git_directories {
+                let project_sandbox = marker_path
+                    .strip_suffix("/.git")
+                    .or_else(|| marker_path.strip_suffix("/.zessionizer"))
+                    .unwrap_or(marker_path);
 
-                    tracing::debug!(
-                        project_name = %project_name,
-                        project_path = %project_path,
-                        "discovered project"
-                    );
+                let project_path = from_sandbox_path(project_sandbox);
 
-                    (project_path.to_string(), project_name.to_string())
-                })
-                .collect();
+                if !seen.insert(project_path.clone()) {
+                    continue;
+                }
+
+                let project_name = project_path
+                    .rsplit('/')
+                    .next()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("unknown")
+                    .to_string();
+
+                tracing::debug!(
+                    project_name = %project_name,
+                    project_path = %project_path,
+                    "discovered project"
+                );
+
+                projects.push((project_path, project_name));
+            }
 
             let mut actions = vec![];
 
             if projects.is_empty() {
                 tracing::debug!("no new projects found during scan");
             } else {
-                actions.push(Action::PostToWorker(
-                    WorkerMessage::add_projects_batch(projects)
-                ));
+                actions.push(Action::PostToWorker(WorkerMessage::add_projects_batch(
+                    projects,
+                )));
             }
 
             Ok((false, actions))
@@ -389,54 +408,130 @@ pub fn handle_event(state: &mut AppState, event: &Event) -> Result<(bool, Vec<Ac
             tracing::debug!(error = %error, "project scan failed");
             Ok((false, vec![]))
         }
-        Event::PermissionsResult { granted: _ } => {
-            Ok((false, vec![]))
-        }
-        Event::WorkerResponse(response) => {
-            match response {
-                WorkerResponse::ProjectsLoaded { projects } => {
-                    if &state.projects == projects {
-                        tracing::debug!("projects unchanged, skipping render");
-                        Ok((false, vec![]))
-                    } else {
-                        let old_filtered = state.filtered_projects.clone();
-                        state.projects.clone_from(projects);
-                        state.apply_search_filter();
-
-                        if state.filtered_projects == old_filtered {
-                            tracing::debug!("filtered projects unchanged after reload, skipping render");
-                            Ok((false, vec![]))
-                        } else {
-                            Ok((true, vec![]))
-                        }
-                    }
-                }
-                WorkerResponse::FrecencyUpdated { path: _ } | WorkerResponse::SessionsSynced { count: _ } => {
+        Event::PermissionsResult { granted: _ } => Ok((false, vec![])),
+        Event::WorkerResponse(response) => match response {
+            WorkerResponse::ProjectsLoaded { projects } => {
+                if &state.projects == projects {
+                    tracing::debug!("projects unchanged, skipping render");
                     Ok((false, vec![]))
-                }
-                WorkerResponse::ProjectsBatchAdded { count, projects } => {
-                    tracing::debug!(count = count, "projects batch added successfully");
-                    if &state.projects == projects {
-                        tracing::debug!("projects unchanged after batch add, skipping render");
+                } else {
+                    let old_filtered = state.filtered_projects.clone();
+                    state.projects.clone_from(projects);
+                    state.apply_search_filter();
+
+                    if state.filtered_projects == old_filtered {
+                        tracing::debug!(
+                            "filtered projects unchanged after reload, skipping render"
+                        );
                         Ok((false, vec![]))
                     } else {
-                        let old_filtered = state.filtered_projects.clone();
-                        state.projects.clone_from(projects);
-                        state.apply_search_filter();
-
-                        if state.filtered_projects == old_filtered {
-                            tracing::debug!("filtered projects unchanged after batch add, skipping render");
-                            Ok((false, vec![]))
-                        } else {
-                            Ok((true, vec![]))
-                        }
+                        Ok((true, vec![]))
                     }
-                }
-                WorkerResponse::Error { message } => {
-                    tracing::error!("Worker error: {}", message);
-                    Ok((true, vec![]))
                 }
             }
+            WorkerResponse::FrecencyUpdated { path: _ }
+            | WorkerResponse::SessionsSynced { count: _ } => Ok((false, vec![])),
+            WorkerResponse::ProjectsBatchAdded { count, projects } => {
+                tracing::debug!(count = count, "projects batch added successfully");
+                if &state.projects == projects {
+                    tracing::debug!("projects unchanged after batch add, skipping render");
+                    Ok((false, vec![]))
+                } else {
+                    let old_filtered = state.filtered_projects.clone();
+                    state.projects.clone_from(projects);
+                    state.apply_search_filter();
+
+                    if state.filtered_projects == old_filtered {
+                        tracing::debug!(
+                            "filtered projects unchanged after batch add, skipping render"
+                        );
+                        Ok((false, vec![]))
+                    } else {
+                        Ok((true, vec![]))
+                    }
+                }
+            }
+            WorkerResponse::Error { message } => {
+                tracing::error!("Worker error: {}", message);
+                Ok((true, vec![]))
+            }
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::theme::Theme;
+    use crate::worker::WorkerMessage;
+
+    fn extract_batch(actions: &[Action]) -> &[(String, String)] {
+        match actions {
+            [Action::PostToWorker(WorkerMessage::AddProjectsBatch { projects, .. })] => projects,
+            other => panic!("expected single AddProjectsBatch action, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn projects_scanned_strips_marker_and_uses_user_paths() {
+        let mut state = AppState::new(vec![], Theme::default());
+        let event = Event::ProjectsScanned {
+            git_directories: vec!["/host/Projects/foo/.git".to_string()],
+        };
+
+        let (_, actions) = handle_event(&mut state, &event).unwrap();
+        let projects = extract_batch(&actions);
+
+        assert_eq!(
+            projects,
+            &[("~/Projects/foo".to_string(), "foo".to_string())]
+        );
+    }
+
+    #[test]
+    fn projects_scanned_dedups_repos_with_both_markers() {
+        let mut state = AppState::new(vec![], Theme::default());
+        let event = Event::ProjectsScanned {
+            git_directories: vec![
+                "/host/Projects/foo/.git".to_string(),
+                "/host/Projects/foo/.zessionizer".to_string(),
+            ],
+        };
+
+        let (_, actions) = handle_event(&mut state, &event).unwrap();
+        let projects = extract_batch(&actions);
+
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].0, "~/Projects/foo");
+    }
+
+    #[test]
+    fn projects_scanned_keeps_distinct_paths_with_same_basename() {
+        let mut state = AppState::new(vec![], Theme::default());
+        let event = Event::ProjectsScanned {
+            git_directories: vec![
+                "/host/Projects/foo/.git".to_string(),
+                "/host/Code/foo/.git".to_string(),
+            ],
+        };
+
+        let (_, actions) = handle_event(&mut state, &event).unwrap();
+        let projects = extract_batch(&actions);
+
+        assert_eq!(projects.len(), 2);
+        let paths: Vec<&str> = projects.iter().map(|(p, _)| p.as_str()).collect();
+        assert!(paths.contains(&"~/Projects/foo"));
+        assert!(paths.contains(&"~/Code/foo"));
+    }
+
+    #[test]
+    fn projects_scanned_emits_no_action_when_empty() {
+        let mut state = AppState::new(vec![], Theme::default());
+        let event = Event::ProjectsScanned {
+            git_directories: vec![],
+        };
+
+        let (_, actions) = handle_event(&mut state, &event).unwrap();
+        assert!(actions.is_empty());
     }
 }

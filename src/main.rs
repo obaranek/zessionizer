@@ -79,7 +79,9 @@ use zellij_tile::prelude::*;
 use zellij_tile::shim::post_message_to;
 
 use zessionizer::worker::{WorkerMessage, WorkerResponse, ZessionizerWorker};
-use zessionizer::{handle_event, Action, Config, Event, InputMode};
+use zessionizer::{
+    handle_event, infrastructure::to_sandbox_path, Action, Config, Event, InputMode,
+};
 
 // Register plugin and worker with Zellij
 register_plugin!(State);
@@ -283,20 +285,14 @@ impl State {
         );
 
         for scan_path in &self.scan_paths {
-            let expanded_path = if scan_path.starts_with("~/") {
-                scan_path.strip_prefix("~/").unwrap_or(scan_path)
-            } else if scan_path == "~" {
-                "."
-            } else {
-                scan_path.as_str()
-            };
+            let sandbox_path = to_sandbox_path(scan_path);
 
-            tracing::debug!(scan_path = %scan_path, expanded_path = %expanded_path, "scanning path");
+            tracing::debug!(scan_path = %scan_path, sandbox_path = %sandbox_path, "scanning path");
 
             run_command(
                 &[
                     "find",
-                    expanded_path,
+                    &sandbox_path,
                     "-maxdepth",
                     &self.scan_depth.to_string(),
                     "(",
