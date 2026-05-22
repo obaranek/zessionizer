@@ -51,7 +51,9 @@ pub enum Action {
     SwitchSession {
         /// Name of the existing session.
         name: String,
-        /// Filesystem path to set as working directory.
+        /// Filesystem path to set as working directory, in user-visible
+        /// (`~/...` or absolute) form. Expanded to an absolute host path at
+        /// dispatch.
         path: PathBuf,
     },
 
@@ -62,7 +64,9 @@ pub enum Action {
     CreateSession {
         /// Name for the new session.
         name: String,
-        /// Filesystem path to set as working directory.
+        /// Filesystem path to set as working directory, in user-visible
+        /// (`~/...` or absolute) form. Expanded to an absolute host path at
+        /// dispatch.
         path: PathBuf,
     },
 
