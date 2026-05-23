@@ -39,7 +39,7 @@ use crate::domain::error::Result;
 use crate::infrastructure::{from_sandbox_path, worktree as worktree_scan};
 use crate::worker::{WorkerMessage, WorkerResponse};
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use zellij_tile::prelude::PermissionType;
 
 /// Events triggered by user input, system changes, or worker responses.
@@ -458,9 +458,12 @@ pub fn handle_event(state: &mut AppState, event: &Event) -> Result<(bool, Vec<Ac
             // Strip the marker suffix (`/.git` or `/.zessionizer`) and convert
             // the in-sandbox `/host/...` form back to the user-visible `~/...`
             // form. Two markers in the same project (e.g. a repo that also has
-            // a `.zessionizer` file) collapse to a single entry via dedup.
+            // a `.zessionizer` file) collapse to a single entry via dedup, and
+            // a project nested inside another (e.g. a Git submodule whose own
+            // `.git` was matched) is dropped in favor of its outermost
+            // ancestor.
+            let mut candidates: Vec<(String, String)> = Vec::with_capacity(git_directories.len());
             let mut seen: HashSet<String> = HashSet::new();
-            let mut projects: Vec<(String, String)> = Vec::with_capacity(git_directories.len());
 
             for marker_path in git_directories {
                 let project_sandbox = marker_path
@@ -480,6 +483,24 @@ pub fn handle_event(state: &mut AppState, event: &Event) -> Result<(bool, Vec<Ac
                     .filter(|s| !s.is_empty())
                     .unwrap_or("unknown")
                     .to_string();
+
+                candidates.push((project_path, project_name));
+            }
+
+            // Sort shortest-first so any accepted entry is a candidate
+            // ancestor for the longer paths that follow.
+            candidates.sort_by_key(|(p, _)| p.len());
+
+            let mut projects: Vec<(String, String)> = Vec::with_capacity(candidates.len());
+            for (project_path, project_name) in candidates {
+                let nested = projects.iter().any(|(parent, _)| is_descendant(&project_path, parent));
+                if nested {
+                    tracing::debug!(
+                        project_path = %project_path,
+                        "skipping nested project (ancestor already accepted)"
+                    );
+                    continue;
+                }
 
                 tracing::debug!(
                     project_name = %project_name,
@@ -555,6 +576,15 @@ pub fn handle_event(state: &mut AppState, event: &Event) -> Result<(bool, Vec<Ac
             }
         },
     }
+}
+
+/// Returns `true` if `candidate` sits inside `parent` (and isn't `parent`
+/// itself). `Path::starts_with` matches whole components, so `~/a/foo` is
+/// not falsely treated as a descendant of `~/a/foobar`.
+fn is_descendant(candidate: &str, parent: &str) -> bool {
+    let parent_path = Path::new(parent.trim_end_matches('/'));
+    let candidate_path = Path::new(candidate);
+    candidate_path != parent_path && candidate_path.starts_with(parent_path)
 }
 
 #[cfg(test)]
@@ -636,6 +666,45 @@ mod tests {
         let paths: Vec<&str> = projects.iter().map(|(p, _)| p.as_str()).collect();
         assert!(paths.contains(&"~/Projects/foo"));
         assert!(paths.contains(&"~/Code/foo"));
+    }
+
+    #[test]
+    fn projects_scanned_drops_nested_submodule_in_favor_of_parent() {
+        // `find` returns both the outer repo's `.git` and a submodule's
+        // `.git` deep inside it. Only the outer repo should be surfaced;
+        // the nested entry would create a phantom row that collides with
+        // any unrelated standalone checkout sharing the same basename.
+        let mut state = empty_state();
+        let event = scan_event(&[
+            "/host/parent/outer/.git",
+            "/host/parent/outer/inner/.git",
+        ]);
+
+        let (_, actions) = handle_event(&mut state, &event).unwrap();
+        let projects = extract_batch(&actions);
+
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].0, "~/parent/outer");
+    }
+
+    #[test]
+    fn projects_scanned_does_not_drop_unrelated_paths_with_shared_prefix() {
+        // `~/parent/foo` must not be treated as a descendant of
+        // `~/parent/foobar` -- the prefix coincides at a non-boundary
+        // character.
+        let mut state = empty_state();
+        let event = scan_event(&[
+            "/host/parent/foobar/.git",
+            "/host/parent/foo/.git",
+        ]);
+
+        let (_, actions) = handle_event(&mut state, &event).unwrap();
+        let projects = extract_batch(&actions);
+
+        let paths: Vec<&str> = projects.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(projects.len(), 2);
+        assert!(paths.contains(&"~/parent/foo"));
+        assert!(paths.contains(&"~/parent/foobar"));
     }
 
     #[test]
