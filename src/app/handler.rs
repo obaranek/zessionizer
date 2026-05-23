@@ -33,10 +33,9 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
-use crate::app::state::WorktreesContext;
 use crate::app::{Action, AppState};
 use crate::domain::error::Result;
-use crate::infrastructure::{from_sandbox_path, worktree as worktree_scan};
+use crate::infrastructure::from_sandbox_path;
 use crate::worker::{WorkerMessage, WorkerResponse};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -78,8 +77,6 @@ pub enum Event {
     ShowProjects,
     /// Switches view to show projects with active sessions.
     ShowSessions,
-    /// Returns from the worktrees drilldown to the previous projects view.
-    Back,
 
     /// Updates the set of active Zellij sessions.
     ///
@@ -176,48 +173,7 @@ pub fn handle_event(state: &mut AppState, event: &Event) -> Result<(bool, Vec<Ac
         }
         Event::CloseFocus => Ok((false, vec![Action::CloseFocus])),
         Event::SelectProject => {
-            use super::modes::{InputMode, ViewMode};
-
-            if matches!(state.view_mode, ViewMode::Worktrees) {
-                let Some(worktree) = state.selected_worktree() else {
-                    return Ok((false, vec![]));
-                };
-                let Some(ctx) = state.worktrees_context.as_ref() else {
-                    return Ok((false, vec![]));
-                };
-
-                let session_name = ctx.project_name.clone();
-                let project_path = ctx.project_path.clone();
-                let cwd = PathBuf::from(&worktree.path);
-
-                tracing::debug!(
-                    session = %session_name,
-                    worktree = %worktree.name,
-                    path = %worktree.path,
-                    "opening session at worktree"
-                );
-
-                // Record against the project root, not the worktree -- the
-                // Sessions view filters projects by their own `path`, not by
-                // the cwd a particular worktree was opened with.
-                state
-                    .session_paths
-                    .insert(session_name.clone(), project_path);
-
-                let action = if state.active_sessions.contains(&session_name) {
-                    Action::SwitchSession {
-                        name: session_name,
-                        path: cwd,
-                    }
-                } else {
-                    Action::CreateSession {
-                        name: session_name,
-                        path: cwd,
-                    }
-                };
-
-                return Ok((false, vec![action]));
-            }
+            use super::modes::InputMode;
 
             let Some(project) = state.selected_project() else {
                 tracing::debug!("no project selected");
@@ -237,30 +193,6 @@ pub fn handle_event(state: &mut AppState, event: &Event) -> Result<(bool, Vec<Ac
                 has_active_session = state.active_sessions.contains(&project.name),
                 "project selected"
             );
-
-            // `scan` always returns at least the trunk entry; sibling
-            // worktrees mean `len() > 1`. Calling it once instead of pairing
-            // with `has_worktrees_dir` halves the syscalls on every Enter.
-            let worktrees = worktree_scan::scan(&project.path);
-            if worktrees.len() > 1 {
-                tracing::debug!(project = %project.name, "drilling into worktrees view");
-                let project_name = project.name.clone();
-                let project_path = project.path.clone();
-                let previous_view = state.view_mode;
-
-                state.worktrees = worktrees;
-                state.worktrees_context = Some(WorktreesContext {
-                    project_name,
-                    project_path,
-                    previous_view,
-                });
-                state.view_mode = ViewMode::Worktrees;
-                state.search_query = String::new();
-                state.input_mode = InputMode::Normal;
-                state.selected_index = 0;
-                state.apply_search_filter();
-                return Ok((true, vec![]));
-            }
 
             let mut actions = vec![];
 
@@ -365,24 +297,6 @@ pub fn handle_event(state: &mut AppState, event: &Event) -> Result<(bool, Vec<Ac
         Event::ShowSessions => {
             use super::modes::ViewMode;
             state.view_mode = ViewMode::Sessions;
-            state.apply_search_filter();
-            Ok((true, vec![]))
-        }
-        Event::Back => {
-            use super::modes::ViewMode;
-            if !matches!(state.view_mode, ViewMode::Worktrees) {
-                return Ok((false, vec![]));
-            }
-            let previous = state
-                .worktrees_context
-                .as_ref()
-                .map_or(ViewMode::Sessions, |c| c.previous_view);
-            state.view_mode = previous;
-            state.worktrees_context = None;
-            state.worktrees = vec![];
-            state.filtered_worktrees = vec![];
-            state.search_query = String::new();
-            state.selected_index = 0;
             state.apply_search_filter();
             Ok((true, vec![]))
         }
@@ -717,37 +631,6 @@ mod tests {
     }
 
     #[test]
-    fn select_project_drills_into_worktrees_when_dir_exists() {
-        let dir = TempDir::new().unwrap();
-        fs::create_dir(dir.path().join(".worktrees")).unwrap();
-        fs::create_dir(dir.path().join(".worktrees").join("feat-a")).unwrap();
-
-        let mut state = state_with_project(dir.path().to_str().unwrap());
-
-        let (rendered, actions) = handle_event(&mut state, &Event::SelectProject).unwrap();
-
-        assert!(
-            rendered,
-            "drilling into worktrees should request a re-render"
-        );
-        assert!(
-            actions.is_empty(),
-            "drilldown should not emit a session action"
-        );
-        assert_eq!(state.view_mode, ViewMode::Worktrees);
-        let names: Vec<&str> = state
-            .filtered_worktrees
-            .iter()
-            .map(|w| w.name.as_str())
-            .collect();
-        assert_eq!(names, vec!["trunk", "feat-a"]);
-
-        let ctx = state.worktrees_context.as_ref().expect("context set");
-        assert_eq!(ctx.previous_view, ViewMode::ProjectsWithoutSessions);
-        assert_eq!(ctx.project_name, "demo");
-    }
-
-    #[test]
     fn select_project_opens_session_when_no_worktrees_dir() {
         let dir = TempDir::new().unwrap();
         let mut state = state_with_project(dir.path().to_str().unwrap());
@@ -756,61 +639,6 @@ mod tests {
 
         assert_eq!(state.view_mode, ViewMode::ProjectsWithoutSessions);
         assert!(matches!(actions.as_slice(), [Action::CreateSession { .. }]));
-    }
-
-    #[test]
-    fn select_worktree_emits_session_action_with_worktree_path() {
-        let dir = TempDir::new().unwrap();
-        fs::create_dir(dir.path().join(".worktrees")).unwrap();
-        let wt_dir = dir.path().join(".worktrees").join("feat-a");
-        fs::create_dir(&wt_dir).unwrap();
-
-        let mut state = state_with_project(dir.path().to_str().unwrap());
-        handle_event(&mut state, &Event::SelectProject).unwrap();
-        // Move selection to feat-a (trunk is index 0).
-        state.selected_index = 1;
-
-        let (_, actions) = handle_event(&mut state, &Event::SelectProject).unwrap();
-
-        match actions.as_slice() {
-            [Action::CreateSession { name, path, .. }] => {
-                assert_eq!(name, "demo", "session name should be the project name");
-                assert_eq!(path, &wt_dir, "cwd should be the worktree path");
-            }
-            other => panic!("expected CreateSession, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn back_returns_to_previous_view_and_clears_worktrees() {
-        let dir = TempDir::new().unwrap();
-        fs::create_dir(dir.path().join(".worktrees")).unwrap();
-        fs::create_dir(dir.path().join(".worktrees").join("feat-a")).unwrap();
-
-        let mut state = state_with_project(dir.path().to_str().unwrap());
-        handle_event(&mut state, &Event::SelectProject).unwrap();
-        assert_eq!(state.view_mode, ViewMode::Worktrees);
-
-        let (rendered, actions) = handle_event(&mut state, &Event::Back).unwrap();
-
-        assert!(rendered);
-        assert!(actions.is_empty());
-        assert_eq!(state.view_mode, ViewMode::ProjectsWithoutSessions);
-        assert!(state.worktrees.is_empty());
-        assert!(state.filtered_worktrees.is_empty());
-        assert!(state.worktrees_context.is_none());
-    }
-
-    #[test]
-    fn back_is_noop_when_not_in_worktrees_view() {
-        let dir = TempDir::new().unwrap();
-        let mut state = state_with_project(dir.path().to_str().unwrap());
-
-        let (rendered, actions) = handle_event(&mut state, &Event::Back).unwrap();
-
-        assert!(!rendered);
-        assert!(actions.is_empty());
-        assert_eq!(state.view_mode, ViewMode::ProjectsWithoutSessions);
     }
 
     #[test]

@@ -404,7 +404,6 @@ impl State {
             },
             BareKey::Char('n') if self.app.input_mode == InputMode::Normal => Event::ShowProjects,
             BareKey::Char('s') if self.app.input_mode == InputMode::Normal => Event::ShowSessions,
-            BareKey::Char('b') if self.app.input_mode == InputMode::Normal => Event::Back,
             BareKey::Backspace => Event::Backspace,
             BareKey::Char(c) => Event::Char(c),
             _ => return None,
