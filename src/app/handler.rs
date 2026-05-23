@@ -187,6 +187,7 @@ pub fn handle_event(state: &mut AppState, event: &Event) -> Result<(bool, Vec<Ac
                 };
 
                 let session_name = ctx.project_name.clone();
+                let project_path = ctx.project_path.clone();
                 let cwd = PathBuf::from(&worktree.path);
 
                 tracing::debug!(
@@ -195,6 +196,13 @@ pub fn handle_event(state: &mut AppState, event: &Event) -> Result<(bool, Vec<Ac
                     path = %worktree.path,
                     "opening session at worktree"
                 );
+
+                // Record against the project root, not the worktree -- the
+                // Sessions view filters projects by their own `path`, not by
+                // the cwd a particular worktree was opened with.
+                state
+                    .session_paths
+                    .insert(session_name.clone(), project_path);
 
                 let action = if state.active_sessions.contains(&session_name) {
                     Action::SwitchSession {
@@ -256,17 +264,24 @@ pub fn handle_event(state: &mut AppState, event: &Event) -> Result<(bool, Vec<Ac
 
             let mut actions = vec![];
 
-            if state.active_sessions.contains(&project.name) {
-                tracing::debug!(session_name = %project.name, "switching to existing session");
+            let project_name = project.name.clone();
+            let project_path = project.path.clone();
+
+            state
+                .session_paths
+                .insert(project_name.clone(), project_path.clone());
+
+            if state.active_sessions.contains(&project_name) {
+                tracing::debug!(session_name = %project_name, "switching to existing session");
                 actions.push(Action::SwitchSession {
-                    name: project.name.clone(),
-                    path: PathBuf::from(&project.path),
+                    name: project_name,
+                    path: PathBuf::from(project_path),
                 });
             } else {
-                tracing::debug!(session_name = %project.name, "creating new session");
+                tracing::debug!(session_name = %project_name, "creating new session");
                 actions.push(Action::CreateSession {
-                    name: project.name.clone(),
-                    path: PathBuf::from(&project.path),
+                    name: project_name,
+                    path: PathBuf::from(project_path),
                 });
             }
 
@@ -378,21 +393,19 @@ pub fn handle_event(state: &mut AppState, event: &Event) -> Result<(bool, Vec<Ac
                 return Ok((false, vec![]));
             }
 
-            state.selected_project().map_or_else(
-                || {
-                    tracing::debug!("no session selected to kill");
-                    Ok((false, vec![]))
-                },
-                |project| {
-                    tracing::debug!(session_name = %project.name, "killing session");
-                    Ok((
-                        false,
-                        vec![Action::KillSession {
-                            name: project.name.clone(),
-                        }],
-                    ))
-                },
-            )
+            let Some(name) = state.selected_project().map(|p| p.name.clone()) else {
+                tracing::debug!("no session selected to kill");
+                return Ok((false, vec![]));
+            };
+
+            tracing::debug!(session_name = %name, "killing session");
+            // Drop the path record now -- a future poll's `retain` would do
+            // the same, but a stale entry between here and the next
+            // `SessionUpdate` would mismatch any same-named project the
+            // user opens in that window.
+            state.session_paths.remove(&name);
+
+            Ok((false, vec![Action::KillSession { name }]))
         }
         Event::SessionUpdate {
             active_sessions,
@@ -416,6 +429,13 @@ pub fn handle_event(state: &mut AppState, event: &Event) -> Result<(bool, Vec<Ac
             if added_count > 0 || removed_count > 0 || current_changed {
                 state.active_sessions.clone_from(active_sessions);
                 state.current_session.clone_from(current_session);
+                // Drop path records for sessions Zellij no longer reports as
+                // alive, so a future open of an unrelated project that
+                // happens to reuse the same name doesn't inherit a stale
+                // path-mismatch from a dead session.
+                state
+                    .session_paths
+                    .retain(|name, _| active_sessions.contains(name));
 
                 let session_names: Vec<String> = active_sessions.iter().cloned().collect();
                 actions.push(Action::PostToWorker(WorkerMessage::sync_sessions(
@@ -722,5 +742,96 @@ mod tests {
         assert!(!rendered);
         assert!(actions.is_empty());
         assert_eq!(state.view_mode, ViewMode::ProjectsWithoutSessions);
+    }
+
+    #[test]
+    fn select_project_records_session_path_for_disambiguation() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().to_str().unwrap().to_string();
+        let mut state = state_with_project(&path);
+
+        handle_event(&mut state, &Event::SelectProject).unwrap();
+
+        assert_eq!(state.session_paths.get("demo"), Some(&path));
+    }
+
+    #[test]
+    fn project_with_active_session_at_other_path_is_not_active() {
+        // Two projects share the basename "demo" -- one at /a/demo, one at
+        // /b/demo. A session named "demo" was opened against /a/demo. Only
+        // /a/demo should report as having an active session.
+        let theme = Theme::default();
+        let project_a = Project::new("/a/demo".to_string(), "demo".to_string());
+        let project_b = Project::new("/b/demo".to_string(), "demo".to_string());
+        let mut state = AppState::new(vec![project_a.clone(), project_b.clone()], theme);
+        state
+            .active_sessions
+            .insert("demo".to_string());
+        state
+            .session_paths
+            .insert("demo".to_string(), "/a/demo".to_string());
+
+        assert!(state.project_has_active_session(&project_a));
+        assert!(!state.project_has_active_session(&project_b));
+    }
+
+    #[test]
+    fn unknown_session_falls_back_to_name_match() {
+        // Session that wasn't opened by zessionizer this lifetime -- we have
+        // no path record. Fall back to legacy name-only matching so the row
+        // still appears somewhere.
+        let theme = Theme::default();
+        let project = Project::new("/some/demo".to_string(), "demo".to_string());
+        let mut state = AppState::new(vec![project.clone()], theme);
+        state.active_sessions.insert("demo".to_string());
+
+        assert!(state.project_has_active_session(&project));
+    }
+
+    #[test]
+    fn session_update_prunes_paths_for_dead_sessions() {
+        // A session named "demo" was opened against /a/demo, then killed.
+        // The next SessionUpdate should drop the stale path so a different
+        // project that later opens with the same name doesn't inherit a
+        // path-mismatch from the dead one.
+        let dir = TempDir::new().unwrap();
+        let mut state = state_with_project(dir.path().to_str().unwrap());
+        state
+            .session_paths
+            .insert("demo".to_string(), "/a/demo".to_string());
+        state.active_sessions.insert("demo".to_string());
+
+        let event = Event::SessionUpdate {
+            active_sessions: HashSet::new(),
+            current_session: None,
+        };
+        handle_event(&mut state, &event).unwrap();
+
+        assert!(state.session_paths.is_empty());
+    }
+
+    #[test]
+    fn kill_session_drops_path_record_immediately() {
+        // The user kills the selected session via `K`. The path record
+        // should be removed in the same turn -- not on the next
+        // SessionUpdate poll -- so a same-named project opened before the
+        // poll fires doesn't see a stale path mismatch.
+        let theme = Theme::default();
+        let project = Project::new("/a/demo".to_string(), "demo".to_string());
+        let mut state = AppState::new(vec![project], theme);
+        state.view_mode = ViewMode::Sessions;
+        state.active_sessions.insert("demo".to_string());
+        state
+            .session_paths
+            .insert("demo".to_string(), "/a/demo".to_string());
+        state.apply_search_filter();
+
+        let (_, actions) = handle_event(&mut state, &Event::KillSession).unwrap();
+
+        assert!(matches!(
+            actions.as_slice(),
+            [Action::KillSession { name }] if name == "demo"
+        ));
+        assert!(!state.session_paths.contains_key("demo"));
     }
 }
