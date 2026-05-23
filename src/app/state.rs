@@ -44,7 +44,7 @@ use super::modes::{InputMode, ViewMode};
 use crate::domain::worktree::Worktree;
 use crate::domain::Project;
 use crate::ui::theme::Theme;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use fuzzy_matcher::skim::SkimMatcherV2;
 
 /// Central application state container.
@@ -101,6 +101,16 @@ pub struct AppState {
     /// Updated by `SessionUpdate` events. Used for view mode filtering and
     /// determining whether to create or switch sessions.
     pub active_sessions: HashSet<String>,
+
+    /// Map from a session name we ourselves opened (or switched to) to the
+    /// project path it was opened against.
+    ///
+    /// Lets the Sessions view disambiguate projects that share a basename:
+    /// only the project at the recorded path is shown as "active" for that
+    /// session name. Falls back to a name-only match for sessions whose
+    /// origin we don't know (e.g., started before the plugin loaded or by
+    /// something other than zessionizer).
+    pub session_paths: HashMap<String, String>,
 
     /// Name of the current Zellij session.
     ///
@@ -172,6 +182,7 @@ impl AppState {
             view_mode: ViewMode::Sessions,
             theme,
             active_sessions: HashSet::new(),
+            session_paths: HashMap::new(),
             current_session: None,
             worktrees: vec![],
             filtered_worktrees: vec![],
@@ -266,6 +277,27 @@ impl AppState {
         self.filtered_projects.get(self.selected_index)
     }
 
+    /// Whether `project` should be treated as having a live Zellij session.
+    ///
+    /// When zessionizer itself opened the session, `session_paths` records
+    /// the project path it was opened against; the project is "active" only
+    /// if its stored path matches that record. For sessions whose origin
+    /// we don't know (started before the plugin loaded, or by something
+    /// other than zessionizer), fall back to the legacy name-only match.
+    /// In the fallback case, *every* project sharing the basename will
+    /// appear active simultaneously -- there's no way to disambiguate
+    /// without a record. Re-opening one of them through zessionizer claims
+    /// the name strictly going forward.
+    #[must_use]
+    pub fn project_has_active_session(&self, project: &Project) -> bool {
+        if !self.active_sessions.contains(&project.name) {
+            return false;
+        }
+        self.session_paths
+            .get(&project.name)
+            .map_or(true, |known_path| known_path == &project.path)
+    }
+
     /// Applies view mode and search filters to the master project list.
     ///
     /// First filters by view mode (sessions vs. all projects), then applies
@@ -338,7 +370,7 @@ impl AppState {
             ViewMode::Sessions | ViewMode::ProjectsWithoutSessions => {
                 let in_sessions = matches!(self.view_mode, ViewMode::Sessions);
                 let filtered_iter = self.projects.iter().filter(|project| {
-                    let has_session = self.active_sessions.contains(&project.name);
+                    let has_session = self.project_has_active_session(project);
                     if has_session != in_sessions {
                         return false;
                     }
